@@ -1,0 +1,72 @@
+# Build directories
+build/
+cmake-build-*/
+out/
+bin/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+x64/
+*.dir/
+
+# Visual Studio
+.vs/
+*.vcxproj.user
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.sln.DotSettings.user
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+
+# Compiled binaries
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+*.so
+*.dylib
+*.a
+
+# Models (use Git LFS instead)
+Models/*.bin
+
+# API Keys & Secrets
+.env
+config.json
+secrets.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# JUCE
+JuceLibraryCode/
+*_artefacts/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.cache

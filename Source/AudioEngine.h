@@ -1,0 +1,271 @@
+/*
+  ==============================================================================
+
+    AudioEngine.h
+    Created: 9 Dec 2024
+    Author: Explicitly Audio Systems
+
+    Lock-free real-time audio processing engine.
+    
+    Responsibilities:
+    - Capture audio from input device
+    - Write to 300ms circular buffer
+    - Push audio chunks to ASR thread via lock-free queue
+    - Apply censorship based on ASR results
+    - Output filtered audio to speakers
+    
+    Thread Safety:
+    - audioDeviceIOCallback runs on real-time thread (no allocations, no locks)
+    - Uses lock-free queues for ASR communication
+
+  ==============================================================================
+*/
+
+#pragma once
+
+#include <juce_audio_devices/juce_audio_devices.h>
+#include <whisper.h>
+#include <atomic>
+#include <vector>
+#include <thread>
+#include "QualityAnalyzer.h"
+#include <mutex>
+#include <condition_variable>
+#include "ProfanityFilter.h"
+#include "LyricsAlignment.h"
+#include "VocalFilter.h"
+#include "TimestampRefiner.h"
+#include "SongRecognition.h"
+#include "WindowsMediaInfo.h"
+#include "Types.h"
+
+class AudioEngine : public juce::AudioIODeviceCallback
+{
+public:
+    enum class CensorMode
+    {
+        Reverse,
+        Mute
+    };
+    
+    AudioEngine();
+    ~AudioEngine() override;
+    
+    /**
+        Start audio processing.
+        
+        @param inputDeviceName      Input device name (microphone, line-in)
+        @param outputDeviceName     Output device name (speakers, headphones)
+        @param mode                 Censorship mode (Reverse or Mute)
+        @return                     true if started successfully
+    */
+    bool start(const juce::String& inputDeviceName,
+               const juce::String& outputDeviceName,
+               CensorMode mode);
+    
+    /**
+        Stop audio processing.
+    */
+    void stop();
+    
+    /**
+        Get current estimated latency in milliseconds.
+        
+        @return     Latency in ms, or -1.0 if not processing
+    */
+    double getCurrentLatency() const;
+    
+    /**
+        Get current buffer capacity in seconds.
+        
+        Buffer starts at 5.1s and grows as processing accumulates (RTF < 1.0x).
+        
+        @return     Buffer size in seconds
+    */
+    double getCurrentBufferSize() const;
+    
+    /**
+        Check if buffer is in underrun state (< 3 seconds).
+        
+        When buffer underruns, censorship is temporarily disabled to prevent glitches.
+        
+        @return     true if buffer is critically low
+    */
+    bool isBufferUnderrun() const;
+    
+    /**
+        Phase 1: Get current input level (RMS).
+        
+        @return     RMS level 0.0-1.0
+    */
+    float getCurrentInputLevel() const;
+    
+    /**
+        Get audio device manager (for device enumeration).
+    */
+    juce::AudioDeviceManager& getDeviceManager() { return deviceManager; }
+    
+    /**
+        Get last error message.
+    */
+    juce::String getLastError() const { return lastError; }
+    
+    /**
+        Phase 8: Get quality analyzer for statistics.
+    */
+    QualityAnalyzer& getQualityAnalyzer() { return qualityAnalyzer; }
+    
+    /**
+        Set debug callback for UI updates.
+    */
+    void setDebugCallback(std::function<void(const juce::String&)> callback) 
+    { 
+        debugCallback = callback; 
+    }
+    
+    /**
+        Set lyrics callback for live display (Whisper transcription).
+    */
+    void setLyricsCallback(std::function<void(const juce::String&)> callback)
+    {
+        lyricsCallback = callback;
+    }
+    
+    /**
+        Set actual lyrics callback for displaying aligned/corrected lyrics.
+    */
+    void setActualLyricsCallback(std::function<void(const juce::String&)> callback)
+    {
+        actualLyricsCallback = callback;
+    }
+    
+    /**
+        Set song info callback for displaying detected song.
+        
+        @param callback Function called with (artist, title, confidence)
+    */
+    void setSongInfoCallback(std::function<void(const juce::String&, const juce::String&, float)> callback)
+    {
+        songInfoCallback = callback;
+    }
+    
+    /**
+        Set song info to fetch lyrics automatically.
+        
+        @param artist   Artist name
+        @param title    Song title
+        @return         true if lyrics fetched successfully
+    */
+    bool setSongInfo(const std::string& artist, const std::string& title);
+    
+    /**
+        Set lyrics manually (skip API fetch).
+        
+        @param lyrics   Song lyrics text
+    */
+    void setManualLyrics(const std::string& lyrics);
+    
+    // AudioIODeviceCallback interface
+    void audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
+                                         int numInputChannels,
+                                         float* const* outputChannelData,
+                                         int numOutputChannels,
+                                         int numSamples,
+                                         const juce::AudioIODeviceCallbackContext& context) override;
+    
+    void audioDeviceAboutToStart(juce::AudioIODevice* device) override;
+    void audioDeviceStopped() override;
+
+private:
+    // Helper methods
+    void whisperThreadFunction();
+    std::vector<float> resampleTo16kHz(const std::vector<float>& input);
+    void processTranscription(const std::vector<float>& buffer, double captureTime);
+    
+    // Audio device
+    juce::AudioDeviceManager deviceManager;
+    
+    // Configuration variables (easy tuning)
+    double chunkSeconds = 2.0;           // Audio chunk size to process (larger chunks = more context)
+    double overlapSeconds = 0.5;         // Overlap between chunks to catch boundary words
+    double initialDelaySeconds = 3.0;   // Initial buffering before playback starts
+    
+    // Simple level tracking for Phase 1-2
+    std::atomic<float> currentInputLevel {0.0f};
+    
+    // Phase 5: Whisper integration with background thread
+    whisper_context* whisperCtx = nullptr;
+    std::vector<float> audioBuffer;          // Accumulation buffer (audio callback writes here)
+    std::vector<float> processingBuffer;     // Copy for background thread to process
+    std::vector<float> audioBuffer16k;
+    int bufferWritePos = 0;
+    int transcriptionInterval = 0;
+    ProfanityFilter profanityFilter;
+    VocalFilter vocalFilter;
+    TimestampRefiner timestampRefiner;  // Phase 6: Accurate timestamp refinement
+    LyricsAlignment lyricsAlignment;     // Phase 7: Lyrics alignment
+    
+    // Phase 7 (Idea 2): Song Recognition & Lyrics Alignment
+    WindowsMediaInfo windowsMediaInfo;
+    bool mediaInfoInitialized = false;
+    SongRecognition songRecognition;  // Fallback for when Windows Media Control unavailable
+    std::atomic<bool> songIdentificationAttempted{false};
+    std::vector<float> recognitionBuffer;
+    const int recognitionBufferSize = 48000 * 10; // 10 seconds @ 48kHz
+    
+    // Song info
+    bool songIdentified = false;
+    SongRecognition::SongInfo currentSong;
+    std::string songLyrics;
+    bool useLyricsAlignment = false;
+    std::string lastSongTitle;
+    std::string lastSongArtist;
+    
+    // Background processing thread
+    std::thread whisperThread;
+    std::atomic<bool> shouldStop{false};
+    std::mutex bufferMutex;
+    std::condition_variable bufferCV;
+    std::atomic<bool> hasNewBuffer{false};
+    
+    // Delay buffer for real-time processing with look-ahead
+    std::vector<std::vector<float>> delayBuffer;
+    int delayBufferSize = 0;
+    int delayReadPos = 0;
+    int delayWritePos = 0;
+    
+    // Runtime state
+    std::atomic<bool> isRunning{false};
+    int numChannels = 0;
+    bool bufferReady = false;
+    std::atomic<bool> shouldStopThread{false};
+    CensorMode currentCensorMode = CensorMode::Reverse;
+    
+    // Playback timing
+    double streamTime = 0.0;
+    std::atomic<bool> playbackStarted{false};
+    std::atomic<bool> wasWaiting{false};
+    int debugCounter = 0;
+    double bufferCaptureTime = 0.0;
+    
+    // Buffer underrun handling
+    std::atomic<bool> bufferUnderrun{false};
+    double lastUnderrunWarningTime = 0.0;
+    
+    // Error handling
+    juce::String lastError;
+    
+    // Callbacks
+    std::function<void(const juce::String&)> debugCallback;
+    std::function<void(const juce::String&)> lyricsCallback;           // Whisper transcription
+    std::function<void(const juce::String&)> actualLyricsCallback;     // Aligned/corrected lyrics
+    std::function<void(const juce::String&, const juce::String&, float)> songInfoCallback;
+    
+    // Quality analysis
+    QualityAnalyzer qualityAnalyzer;
+    
+    // Runtime state
+    CensorMode censorMode = CensorMode::Reverse;
+    int sampleRate = 48000;
+    double totalProcessed = 0.0;
+};

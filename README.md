@@ -32,8 +32,8 @@
 
 ```powershell
 # Clone the repository (Git LFS will automatically download the model)
-git clone https://github.com/AndrewMahran7/ExplicitlyAudioTech.git
-cd ExplicitlyAudioTech/desktop
+git clone https://github.com/AndrewMahran7/ExplicitlyDesktop.git
+cd ExplicitlyDesktop
 
 # Initialize JUCE submodules
 git submodule update --init --recursive
@@ -267,9 +267,9 @@ desktop/
 We welcome contributions! Whether you're fixing bugs, adding features, or improving documentation, your help is appreciated.
 
 - 📖 Read our [Contributing Guide](CONTRIBUTING.md)
-- 🐛 [Report a Bug](https://github.com/AndrewMahran7/ExplicitlyAudioTech/issues/new?template=bug_report.md)
-- 💡 [Request a Feature](https://github.com/AndrewMahran7/ExplicitlyAudioTech/issues/new?template=feature_request.md)
-- 👥 Check out [Good First Issues](https://github.com/AndrewMahran7/ExplicitlyAudioTech/labels/good%20first%20issue)
+- 🐛 [Report a Bug](https://github.com/AndrewMahran7/ExplicitlyDesktop/issues/new?template=bug_report.md)
+- 💡 [Request a Feature](https://github.com/AndrewMahran7/ExplicitlyDesktop/issues/new?template=feature_request.md)
+- 👥 Check out [Good First Issues](https://github.com/AndrewMahran7/ExplicitlyDesktop/labels/good%20first%20issue)
 
 ### Quick Contribution Checklist
 
@@ -325,10 +325,11 @@ Proprietary - See [LICENSE](LICENSE) for details.
 ## Support
 
 For questions, bug reports, or feature requests, please open an issue on GitHub:
-https://github.com/AndrewMahran7/ExplicitlyAudioTech/issues
+https://github.com/AndrewMahran7/ExplicitlyDesktop/issues
 
 ---
 
 **Made with ❤️ by Andrew Mahran (Explicitly Audio Systems)**
-#   E x p l i c i t l y D e s k t o p  
+#   E x p l i c i t l y D e s k t o p 
+ 
  
