@@ -39,9 +39,6 @@ Makefile
 *.dylib
 *.a
 
-# Models (use Git LFS instead)
-Models/*.bin
-
 # API Keys & Secrets
 .env
 config.json
