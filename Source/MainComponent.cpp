@@ -155,6 +155,17 @@ MainComponent::MainComponent()
     exportLogButton.onClick = [this] { exportDebugLog(); };
     addAndMakeVisible (exportLogButton);
     
+    // Testing mode toggle
+    testingModeToggle.setButtonText ("Testing Mode (Log Files)");
+    testingModeToggle.setToggleState (false, juce::dontSendNotification);
+    testingModeToggle.onClick = [this] {
+        if (audioEngine != nullptr)
+        {
+            audioEngine->setTestingMode (testingModeToggle.getToggleState());
+        }
+    };
+    addAndMakeVisible (testingModeToggle);
+    
     // Initialize audio engine
     audioEngine = std::make_unique<AudioEngine>();
     
@@ -310,6 +321,8 @@ void MainComponent::resized()
     showRawJsonToggle.setBounds (debugControls.removeFromLeft (150));
     debugControls.removeFromLeft (10);
     exportLogButton.setBounds (debugControls.removeFromLeft (150));
+    debugControls.removeFromLeft (10);
+    testingModeToggle.setBounds (debugControls.removeFromLeft (200));
 }
 
 void MainComponent::timerCallback()

@@ -28,6 +28,8 @@
 #include <iomanip>
 #include <regex>
 #include <thread>
+#include <fstream>
+#include <ctime>
 
 // Helper function to clean Whisper transcript text
 static std::string cleanTranscriptText(const std::string& text)
@@ -65,6 +67,40 @@ static std::string cleanTranscriptText(const std::string& text)
     return cleaned;
 }
 
+// Add this helper function
+std::string mergeCommonSplits(const std::string& text)
+{
+    std::string merged = text;
+    
+    // Common profanity splits - merge them
+    std::vector<std::pair<std::string, std::string>> replacements = {
+        {"nig ga", "nigga"},
+        {"nigg a", "nigga"},
+        {"N igg", "Nigg"},
+        {"b itch", "bitch"},
+        {"B itch", "Bitch"},
+        {"f uck", "fuck"},
+        {"F uck", "Fuck"},
+        {"f ucking", "fucking"},
+        {"F ucking", "Fucking"},
+        {"sh it", "shit"},
+        {"Sh it", "Shit"}
+    };
+    
+    for (const auto& [split, whole] : replacements)
+    {
+        size_t pos = 0;
+        while ((pos = merged.find(split, pos)) != std::string::npos)
+        {
+            merged.replace(pos, split.length(), whole);
+            std::cout << "[MERGE] Fixed split word: \"" << split << "\" → \"" << whole << "\"" << std::endl;
+            pos += whole.length();
+        }
+    }
+    
+    return merged;
+}
+
 AudioEngine::AudioEngine()
 {
     // Phase 4: Load profanity filter
@@ -83,8 +119,8 @@ AudioEngine::AudioEngine()
     whisper_context_params cparams = whisper_context_default_params();
     cparams.use_gpu = false;  // CPU only for consistency
     cparams.dtw_token_timestamps = true;  // Enable DTW for better timestamp alignment
-    cparams.dtw_aheads_preset = WHISPER_AHEADS_TINY_EN;  // Use tiny.en alignment preset
-    whisperCtx = whisper_init_from_file_with_params("Models/ggml-tiny.en.bin", cparams);
+    cparams.dtw_aheads_preset = WHISPER_AHEADS_BASE_EN;  // Use base.en alignment preset
+    whisperCtx = whisper_init_from_file_with_params("Models/ggml-base.en.bin", cparams);
     
     if (whisperCtx == nullptr)
     {
@@ -92,7 +128,7 @@ AudioEngine::AudioEngine()
     }
     else
     {
-        std::cout << "[Phase5] Whisper small.en model loaded successfully" << std::endl;
+        std::cout << "[Phase5] Whisper base.en model loaded successfully" << std::endl;
     }
 }
 
@@ -267,9 +303,9 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
                                 songLyrics = lyricsInfo.lyrics;
                                 lyricsAlignment.reset();
                                 lyricsAlignment.setLyrics(songLyrics);
-                                useLyricsAlignment = true;
+                                // useLyricsAlignment = true;  // DISABLED FOR TESTING
                                 
-                                std::cout << "[LyricsFetch] ✓ Lyrics ready! Alignment enabled (" 
+                                std::cout << "[LyricsFetch] ✓ Lyrics ready! Alignment DISABLED for testing (" 
                                          << songLyrics.length() << " chars)" << std::endl;
                             }
                             else
@@ -318,9 +354,9 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
                             songLyrics = lyricsInfo.lyrics;
                             lyricsAlignment.reset();
                             lyricsAlignment.setLyrics(songLyrics);
-                            useLyricsAlignment = true;
+                            // useLyricsAlignment = true;  // DISABLED FOR TESTING
                             
-                            std::cout << "[LyricsFetch] ✓ Initial lyrics ready! Alignment enabled (" 
+                            std::cout << "[LyricsFetch] ✓ Initial lyrics ready! Alignment DISABLED for testing (" 
                                      << songLyrics.length() << " chars)" << std::endl;
                         }
                         else
@@ -382,6 +418,14 @@ void AudioEngine::stop()
     if (!isRunning)
         return;
     
+    // Write testing log before stopping if testing mode is active
+    if (testingMode && !lastSongTitle.empty())
+    {
+        std::cout << "[Testing] Writing log on stop for: " << lastSongArtist << " - " << lastSongTitle << std::endl;
+        writeTestingLog(lastSongArtist, lastSongTitle);
+        currentSongPredictions.clear();
+    }
+    
     deviceManager.removeAudioCallback(this);
     deviceManager.closeAudioDevice();
     
@@ -427,9 +471,9 @@ bool AudioEngine::setSongInfo(const std::string& artist, const std::string& titl
     }
     
     songLyrics = songInfo.lyrics;
-    useLyricsAlignment = true;
+    // useLyricsAlignment = true;  // DISABLED FOR TESTING
     
-    std::cout << "[Lyrics] Lyrics loaded successfully (" << songLyrics.length() << " chars)" << std::endl;
+    std::cout << "[Lyrics] Lyrics loaded successfully (ALIGNMENT DISABLED) (" << songLyrics.length() << " chars)" << std::endl;
     return true;
 }
 
@@ -467,6 +511,16 @@ double AudioEngine::getCurrentBufferSize() const
 bool AudioEngine::isBufferUnderrun() const
 {
     return bufferUnderrun.load();
+}
+
+void AudioEngine::setTestingMode(bool enabled)
+{
+    testingMode = enabled;
+    std::cout << "[Testing] Testing mode " << (enabled ? "ENABLED" : "DISABLED") << std::endl;
+    if (enabled)
+    {
+        std::cout << "[Testing] Will create log files for each song with profanity predictions" << std::endl;
+    }
 }
 
 float AudioEngine::getCurrentInputLevel() const
@@ -834,6 +888,93 @@ void AudioEngine::whisperThreadFunction()
     std::cout << "[Phase5] Whisper background thread exiting" << std::endl;
 }
 
+// Write testing log file for current song
+void AudioEngine::writeTestingLog(const std::string& artist, const std::string& title)
+{
+    if (!testingMode)
+        return;
+    
+    // Get current timestamp for filename
+    auto now = std::chrono::system_clock::now();
+    auto time_t_now = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_now;
+    localtime_s(&tm_now, &time_t_now);
+    
+    char timestamp[32];
+    std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d_%H-%M-%S", &tm_now);
+    
+    // Create safe filename (remove invalid characters)
+    std::string safeArtist = artist;
+    std::string safeTitle = title;
+    
+    // Handle empty artist/title
+    if (safeArtist.empty()) safeArtist = "Unknown_Artist";
+    if (safeTitle.empty()) safeTitle = "Unknown_Title";
+    
+    auto sanitize = [](std::string& str) {
+        for (char& c : str)
+        {
+            if (c == '/' || c == '\\' || c == ':' || c == '*' || 
+                c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+            {
+                c = '_';
+            }
+        }
+    };
+    
+    sanitize(safeArtist);
+    sanitize(safeTitle);
+    
+    // Create TestLogs directory if it doesn't exist
+    juce::File logsDir = juce::File::getCurrentWorkingDirectory().getChildFile("TestLogs");
+    if (!logsDir.exists())
+    {
+        logsDir.createDirectory();
+        std::cout << "[Testing] Created TestLogs directory: " << logsDir.getFullPathName() << std::endl;
+    }
+    
+    std::string filename = logsDir.getChildFile(safeArtist + " - " + safeTitle + " - " + timestamp + ".txt").getFullPathName().toStdString();
+    
+    // Write log file
+    std::ofstream logFile(filename);
+    if (!logFile.is_open())
+    {
+        std::cout << "[Testing] ERROR: Failed to create log file: " << filename << std::endl;
+        return;
+    }
+    
+    logFile << "=================================================\n";
+    logFile << "Explicitly Desktop - Profanity Detection Log\n";
+    logFile << "=================================================\n";
+    logFile << "Artist: " << artist << "\n";
+    logFile << "Title: " << title << "\n";
+    logFile << "Date: " << timestamp << "\n";
+    logFile << "Total Predictions: " << currentSongPredictions.size() << "\n";
+    logFile << "=================================================\n\n";
+    
+    for (size_t i = 0; i < currentSongPredictions.size(); ++i)
+    {
+        const auto& pred = currentSongPredictions[i];
+        logFile << "[" << (i + 1) << "] ";
+        logFile << "\"" << pred.word << "\" ";
+        logFile << "at " << std::fixed << std::setprecision(2) << pred.timestamp << "s ";
+        logFile << "(" << pred.censorMode << ")";
+        if (pred.isMultiWord)
+            logFile << " [MULTI-WORD]";
+        logFile << "\n";
+    }
+    
+    logFile << "\n=================================================\n";
+    logFile << "End of Log\n";
+    logFile << "=================================================\n";
+    
+    logFile.close();
+    
+    std::cout << "[Testing] ✓ Log file created: " << filename << std::endl;
+    std::cout << "[Testing]   Predictions logged: " << currentSongPredictions.size() << std::endl;
+    std::cout << "[Testing]   Full path: " << filename << std::endl;
+}
+
 std::vector<float> AudioEngine::resampleTo16kHz(const std::vector<float>& input)
 {
     if (sampleRate == 16000)
@@ -895,6 +1036,23 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         
         audioBuffer16k = resampleTo16kHz(bufferCopy);
         
+        // DEBUG: Save first 10 chunks to WAV for quality inspection
+        static int chunkCounter = 0;
+        if (chunkCounter < 10)
+        {
+            // Create DebugAudio directory if it doesn't exist
+            juce::File debugDir = juce::File::getCurrentWorkingDirectory().getChildFile("DebugAudio");
+            if (!debugDir.exists())
+            {
+                debugDir.createDirectory();
+                std::cout << "[DEBUG] Created DebugAudio directory: " << debugDir.getFullPathName() << std::endl;
+            }
+            
+            std::string filename = debugDir.getChildFile("debug_chunk_" + juce::String(chunkCounter++) + ".wav").getFullPathName().toStdString();
+            saveWavFile(filename, audioBuffer16k, 16000);
+            std::cout << "[DEBUG] Saved " << filename << " for inspection" << std::endl;
+        }
+        
         std::cout << "[Phase5] Resampled " << samplesToProcess << " samples to " 
                   << audioBuffer16k.size() << " samples @ 16kHz" << std::endl;
         
@@ -908,12 +1066,14 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         wparams.language = "en";
         wparams.n_threads = 8;  // Increase threads (use all CPU cores)
         wparams.single_segment = false;
-        wparams.max_len = 1;  // Enable word-level timestamps
+        wparams.token_timestamps = false;
+        wparams.max_len = 0;
         
         // Speed optimizations (valid parameters only)
-        wparams.audio_ctx = 0;  // Use default context
-        wparams.temperature = 0.0f;  // Deterministic decoding (faster)
-        wparams.entropy_thold = 2.4f;  // Skip uncertain segments
+        wparams.audio_ctx = 1500;  // Enable audio context for music disambiguation
+        wparams.temperature = 0.0f;  // Start with greedy decoding
+        wparams.temperature_inc = 0.2f;  // Try multiple decoding strategies (0, 0.2, 0.4, 0.6, 0.8, 1.0)
+        wparams.entropy_thold = 5.0f;  // Don't skip uncertain segments (music has high entropy)
         wparams.logprob_thold = -1.0f;  // Accept lower probability tokens (faster)
         
         // Run transcription
@@ -1052,24 +1212,7 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                     std::cout << "[SongChange] New song detected! " << currentMedia.artist 
                              << " - " << currentMedia.title << std::endl;
                     
-                    // Update tracked song info
-                    lastSongTitle = currentMedia.title;
-                    lastSongArtist = currentMedia.artist;
-                    
-                    // Fetch new lyrics
-                    useLyricsAlignment = false;
-                    lyricsAlignment.reset();
-                    songLyrics.clear();
-                    
-                    if (songInfoCallback)
-                    {
-                        juce::MessageManager::callAsync([this, currentMedia]() {
-                            songInfoCallback(juce::String(currentMedia.artist), 
-                                           juce::String(currentMedia.title), 
-                                           1.0f);
-                        });
-                    }
-                    
+                    // Testing mode: Write log file for previous song before switching
                     // Launch background lyrics fetch
                     std::string artist = currentMedia.artist;
                     std::string title = currentMedia.title;
@@ -1083,9 +1226,9 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                                 songLyrics = lyricsInfo.lyrics;
                                 lyricsAlignment.reset();
                                 lyricsAlignment.setLyrics(songLyrics);
-                                useLyricsAlignment = true;
+                                // useLyricsAlignment = true;  // DISABLED FOR TESTING
                                 
-                                std::cout << "[SongChange] ✓ New song lyrics loaded!" << std::endl;
+                                std::cout << "[SongChange] ✓ New song lyrics loaded! (ALIGNMENT DISABLED)" << std::endl;
                             }
                             else
                             {
@@ -1101,8 +1244,13 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         
         if (useLyricsAlignment && !songLyrics.empty())
         {
+            finalWords = lyricsAlignment.alignChunk(transcribedWords, songElapsedTime);
             
-            finalWords = lyricsAlignment.alignChunk(transcribedWords);
+            // Only increment time if we actually had transcribed words (audio was playing)
+            if (!transcribedWords.empty())
+            {
+                songElapsedTime += chunkSeconds;
+            }
             
             // BUGFIX: If alignment returns empty (no match), fall back to raw Whisper
             if (finalWords.empty() && !transcribedWords.empty())
@@ -1182,32 +1330,84 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         }
         
         // Check for single-word AND multi-word profanity
+        std::vector<bool> wordAlreadyCensored(finalWords.size(), false);  // Track which words are already handled
+        
         for (size_t idx = 0; idx < finalWords.size(); ++idx)
         {
+            // Skip if this word was already part of a multi-word profanity
+            if (wordAlreadyCensored[idx])
+                continue;
+            
             const auto& wordSeg = finalWords[idx];
             fullTranscript += wordSeg.word + " ";
             
-            // Check single word profanity
-            std::string normalizedWord = LyricsAlignment::normalizeText(wordSeg.word);
+            bool foundProfanity = false;
+            std::string profanityText;
+            double profanityStart, profanityEnd;
+            bool isMultiWord = false;
             
-            if (profanityFilter.isProfane(normalizedWord))
+            // FIRST: Check multi-word profanity patterns (prioritize longer matches)
+            if (idx + 1 < finalWords.size())
+            {
+                const auto& nextWord = finalWords[idx + 1];
+                std::string combined = LyricsAlignment::normalizeText(wordSeg.word + nextWord.word);
+                
+                if (profanityFilter.isProfane(combined))
+                {
+                    foundProfanity = true;
+                    profanityText = wordSeg.word + " " + nextWord.word;
+                    profanityStart = wordSeg.start;
+                    profanityEnd = nextWord.end;
+                    isMultiWord = true;
+                    
+                    // Mark both words as handled
+                    wordAlreadyCensored[idx] = true;
+                    wordAlreadyCensored[idx + 1] = true;
+                }
+            }
+            
+            // SECOND: If no multi-word match, check single word profanity
+            if (!foundProfanity)
+            {
+                std::string normalizedWord = LyricsAlignment::normalizeText(wordSeg.word);
+                
+                if (profanityFilter.isProfane(normalizedWord))
+                {
+                    foundProfanity = true;
+                    profanityText = wordSeg.word;
+                    profanityStart = wordSeg.start;
+                    profanityEnd = wordSeg.end;
+                    isMultiWord = false;
+                    
+                    wordAlreadyCensored[idx] = true;
+                }
+            }
+            
+            // Process the detected profanity (single or multi-word)
+            if (foundProfanity)
             {
                 // Skip censorship if buffer is critically low (emergency bypass)
                 if (bufferUnderrun.load())
                 {
-                    std::cout << "[Phase6] Profanity \"" << wordSeg.word 
+                    std::cout << "[Phase6] Profanity \"" << profanityText
                               << "\" detected but SKIPPING (buffer underrun)" << std::endl;
                     
                     // Phase 8: Record skipped word
-                    qualityAnalyzer.recordCensorshipEvent(wordSeg.word, wordSeg.start, false, "SKIPPED", false);
+                    qualityAnalyzer.recordCensorshipEvent(profanityText, profanityStart, false, "SKIPPED", isMultiWord);
                     continue;
                 }
                 
-                detectedWords.push_back(wordSeg.word);
+                detectedWords.push_back(profanityText);
                 
                 // Phase 8: Record censorship event
                 std::string modeStr = (currentCensorMode == CensorMode::Reverse) ? "REVERSE" : "MUTE";
-                qualityAnalyzer.recordCensorshipEvent(wordSeg.word, wordSeg.start, true, modeStr, false);
+                qualityAnalyzer.recordCensorshipEvent(profanityText, profanityStart, true, modeStr, isMultiWord);
+                
+                // Testing mode: Track this prediction
+                if (testingMode)
+                {
+                    currentSongPredictions.emplace_back(profanityText, profanityStart, modeStr, isMultiWord);
+                }
                 
                 // Phase 6: Calculate position in delay buffer
                 // captureTime stores where the chunk ENDS (writePos when captured)
@@ -1220,8 +1420,8 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                 double paddingBefore = 0.4;  // 400ms before word (catch early starts)
                 double paddingAfter = 0.1;   // 100ms after word (tight end)
                 
-                int startSample = (int)((wordSeg.start - paddingBefore) * sampleRate);
-                int endSample = (int)((wordSeg.end + paddingAfter) * sampleRate);
+                int startSample = (int)((profanityStart - paddingBefore) * sampleRate);
+                int endSample = (int)((profanityEnd + paddingAfter) * sampleRate);
                 
                 // Clamp to valid range (0 to chunkSeconds)
                 int maxSample = (int)(sampleRate * chunkSeconds);
@@ -1237,10 +1437,11 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                 int distanceFromRead = (actualStartPos - currentReadPos + delayBufferSize) % delayBufferSize;
                 double secondsAhead = (double)distanceFromRead / sampleRate;
                 
-                std::cout << "[Phase6] *** PROFANITY: \"" << wordSeg.word << "\" ***" << std::endl;
-                std::cout << "[Phase6]     Whisper timestamp: " << wordSeg.start << "s - " << wordSeg.end << "s" << std::endl;
-                std::cout << "[Phase6]     With padding: " << (wordSeg.start - paddingBefore) << "s - " 
-                         << (wordSeg.end + paddingAfter) << "s" << std::endl;
+                std::string profanityTypeLabel = isMultiWord ? "MULTI-WORD PROFANITY" : "PROFANITY";
+                std::cout << "[Phase6] *** " << profanityTypeLabel << ": \"" << profanityText << "\" ***" << std::endl;
+                std::cout << "[Phase6]     Whisper timestamp: " << profanityStart << "s - " << profanityEnd << "s" << std::endl;
+                std::cout << "[Phase6]     With padding: " << (profanityStart - paddingBefore) << "s - " 
+                         << (profanityEnd + paddingAfter) << "s" << std::endl;
                 std::cout << "[Phase6]     Sample range in chunk: " << startSample << " - " << endSample 
                          << " (" << (endSample - startSample) << " samples)" << std::endl;
                 std::cout << "[Phase6]     Buffer positions: chunkEnd=" << chunkEndPos << ", chunkStart=" << chunkStartPos 
@@ -1316,100 +1517,6 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                     std::cout << "[Phase6]     ✓ REVERSED in delay buffer" << std::endl;
                 }
             }
-            
-            // Check multi-word profanity patterns (e.g., "nig ga" → "nigga")
-            if (idx + 1 < finalWords.size())
-            {
-                const auto& nextWord = finalWords[idx + 1];
-                std::string combined = LyricsAlignment::normalizeText(wordSeg.word + nextWord.word);
-                
-                // Also try with space removed
-                if (profanityFilter.isProfane(combined))
-                {
-                    // Skip censorship if buffer is critically low
-                    if (bufferUnderrun.load())
-                    {
-                        std::cout << "[Phase6] Multi-word profanity \"" << wordSeg.word << " " << nextWord.word
-                                  << "\" detected but SKIPPING (buffer underrun)" << std::endl;
-                        continue;
-                    }
-                    
-                    detectedWords.push_back(wordSeg.word + " " + nextWord.word);
-                    
-                    // Phase 8: Record multi-word censorship
-                    std::string modeStr = (currentCensorMode == CensorMode::Reverse) ? "REVERSE" : "MUTE";
-                    qualityAnalyzer.recordCensorshipEvent(wordSeg.word + " " + nextWord.word, 
-                                                         wordSeg.start, true, modeStr, true);
-                    
-                    // Calculate position for multi-word profanity
-                    int chunkEndPos = (int)captureTime;
-                    int chunkStartPos = (chunkEndPos - (int)(sampleRate * chunkSeconds) + delayBufferSize) % delayBufferSize;
-                    // Tiny model asymmetric padding
-                    double paddingBefore = 0.4;  // 400ms before
-                    double paddingAfter = 0.1;   // 100ms after
-                    
-                    int startSample = (int)((wordSeg.start - paddingBefore) * sampleRate);
-                    int endSample = (int)((nextWord.end + paddingAfter) * sampleRate);
-                    
-                    int maxSample = (int)(sampleRate * chunkSeconds);
-                    startSample = std::max(0, std::min(startSample, maxSample));
-                    endSample = std::max(startSample, std::min(endSample, maxSample));
-                    
-                    std::cout << "[Phase6] *** MULTI-WORD PROFANITY: \"" << wordSeg.word << " " << nextWord.word << "\" ***" << std::endl;
-                    std::cout << "[Phase6]     Combined: " << wordSeg.start << "s - " << nextWord.end << "s" << std::endl;
-                    std::cout << "[Phase6]     Sample range: " << startSample << " - " << endSample << std::endl;
-                    
-                    int numSamplesToCensor = endSample - startSample;
-                    int fadeSamples = std::min(480, numSamplesToCensor / 4);
-                    
-                    if (currentCensorMode == CensorMode::Mute)
-                    {
-                        for (int ch = 0; ch < 2; ++ch)
-                        {
-                            for (int i = startSample; i < endSample; ++i)
-                            {
-                                int delayPos = (chunkStartPos + i) % delayBufferSize;
-                                delayBuffer[ch][delayPos] = 0.0f;
-                            }
-                        }
-                        std::cout << "[Phase6]     ✓ Multi-word MUTED" << std::endl;
-                    }
-                    else if (currentCensorMode == CensorMode::Reverse)
-                    {
-                        for (int ch = 0; ch < 2; ++ch)
-                        {
-                            std::vector<float> tempBuffer(numSamplesToCensor);
-                            for (int i = 0; i < numSamplesToCensor; ++i)
-                            {
-                                int delayPos = (chunkStartPos + startSample + i) % delayBufferSize;
-                                tempBuffer[i] = delayBuffer[ch][delayPos];
-                            }
-                            
-                            std::reverse(tempBuffer.begin(), tempBuffer.end());
-                            
-                            for (int i = 0; i < numSamplesToCensor; ++i)
-                            {
-                                float sample = tempBuffer[i];
-                                float volumeReduction = 0.5f;
-                                
-                                if (i < fadeSamples)
-                                    sample *= ((float)i / fadeSamples) * volumeReduction;
-                                else if (i >= numSamplesToCensor - fadeSamples)
-                                    sample *= ((float)(numSamplesToCensor - i) / fadeSamples) * volumeReduction;
-                                else
-                                    sample *= volumeReduction;
-                                
-                                int delayPos = (chunkStartPos + startSample + i) % delayBufferSize;
-                                delayBuffer[ch][delayPos] = sample;
-                            }
-                        }
-                        std::cout << "[Phase6]     ✓ Multi-word REVERSED" << std::endl;
-                    }
-                    
-                    // Skip the next word since we already processed it
-                    idx++;
-                }
-            }
         }
         
         std::cout << "[Phase6] \"" << fullTranscript << "\"" << std::endl;
@@ -1448,4 +1555,53 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
     {
         std::cout << "[Phase6] Exception in processTranscription: " << e.what() << std::endl;
     }
+}
+
+void AudioEngine::saveWavFile(const std::string& filename, const std::vector<float>& samples, int sampleRate)
+{
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open())
+    {
+        std::cerr << "[ERROR] Could not open " << filename << " for writing" << std::endl;
+        return;
+    }
+    
+    // WAV header (44 bytes)
+    file.write("RIFF", 4);
+    int32_t fileSize = 36 + samples.size() * 2;
+    file.write(reinterpret_cast<char*>(&fileSize), 4);
+    file.write("WAVE", 4);
+    
+    // fmt chunk
+    file.write("fmt ", 4);
+    int32_t fmtSize = 16;
+    file.write(reinterpret_cast<char*>(&fmtSize), 4);
+    int16_t audioFormat = 1; // PCM
+    file.write(reinterpret_cast<char*>(&audioFormat), 2);
+    int16_t numChannels = 1; // Mono
+    file.write(reinterpret_cast<char*>(&numChannels), 2);
+    file.write(reinterpret_cast<char*>(&sampleRate), 4);
+    int32_t byteRate = sampleRate * 2; // 16-bit = 2 bytes per sample
+    file.write(reinterpret_cast<char*>(&byteRate), 4);
+    int16_t blockAlign = 2;
+    file.write(reinterpret_cast<char*>(&blockAlign), 2);
+    int16_t bitsPerSample = 16;
+    file.write(reinterpret_cast<char*>(&bitsPerSample), 2);
+    
+    // data chunk
+    file.write("data", 4);
+    int32_t dataSize = samples.size() * 2;
+    file.write(reinterpret_cast<char*>(&dataSize), 4);
+    
+    // Convert float [-1.0, 1.0] to int16 [-32768, 32767]
+    for (float sample : samples)
+    {
+        // Clamp to prevent overflow
+        float clamped = std::max(-1.0f, std::min(1.0f, sample));
+        int16_t intSample = static_cast<int16_t>(clamped * 32767.0f);
+        file.write(reinterpret_cast<char*>(&intSample), 2);
+    }
+    
+    file.close();
+    std::cout << "[DEBUG] Saved " << samples.size() << " samples to " << filename << std::endl;
 }

@@ -147,104 +147,6 @@ SongInfo LyricsAlignment::fetchLyricsFromOvh(const std::string& artist, const st
     return SongInfo(artist, title, lyrics);
 }
 
-// Extract lyrics from Genius HTML page (unused - kept for reference)
-std::string LyricsAlignment::extractLyricsFromHtml(const std::string& html)
-{
-    std::string lyrics;
-    
-    // Find all divs with data-lyrics-container="true"
-    size_t pos = 0;
-    while ((pos = html.find("data-lyrics-container=\"true\"", pos)) != std::string::npos)
-    {
-        // Find the content between > and </div>
-        size_t contentStart = html.find(">", pos) + 1;
-        size_t contentEnd = html.find("</div>", contentStart);
-        
-        if (contentEnd == std::string::npos) break;
-        
-        std::string section = html.substr(contentStart, contentEnd - contentStart);
-        
-        // Remove HTML tags and extract text
-        std::string cleaned = removeHtmlTags(section);
-        lyrics += cleaned + "\n";
-        
-        pos = contentEnd;
-    }
-    
-    return lyrics;
-}
-
-// Remove HTML tags from string
-std::string LyricsAlignment::removeHtmlTags(const std::string& html)
-{
-    std::string result;
-    bool inTag = false;
-    
-    for (size_t i = 0; i < html.length(); ++i)
-    {
-        char c = html[i];
-        
-        if (c == '<')
-        {
-            inTag = true;
-            // Add space between elements for readability
-            if (!result.empty() && result.back() != ' ' && result.back() != '\n')
-                result += ' ';
-        }
-        else if (c == '>')
-        {
-            inTag = false;
-        }
-        else if (!inTag)
-        {
-            // Handle HTML entities
-            if (c == '&' && i + 1 < html.length())
-            {
-                // Look for common entities
-                if (html.substr(i, 4) == "&lt;")
-                {
-                    result += '<';
-                    i += 3;
-                }
-                else if (html.substr(i, 4) == "&gt;")
-                {
-                    result += '>';
-                    i += 3;
-                }
-                else if (html.substr(i, 5) == "&amp;")
-                {
-                    result += '&';
-                    i += 4;
-                }
-                else if (html.substr(i, 6) == "&quot;")
-                {
-                    result += '"';
-                    i += 5;
-                }
-                else if (html.substr(i, 6) == "&apos;")
-                {
-                    result += '\'';
-                    i += 5;
-                }
-                else
-                {
-                    result += c;
-                }
-            }
-            else if (c == '\r')  // Skip carriage returns
-            {
-                continue;
-            }
-            else
-            {
-                result += c;
-            }
-        }
-    }
-    
-    return result;
-}
-
 // URL-encode a string
 std::string LyricsAlignment::urlEncode(const std::string& value)
 {
@@ -824,7 +726,8 @@ std::vector<WordSegment> LyricsAlignment::mapTimestamps(
 
 // Main forced alignment logic
 std::vector<WordSegment> LyricsAlignment::alignChunk(
-    const std::vector<WordSegment>& transcribedWords)
+    const std::vector<WordSegment>& transcribedWords,
+    double absoluteTime)
 {
     // Check if ready
     if (!initialized || preprocessedLyrics.empty())
@@ -847,15 +750,37 @@ std::vector<WordSegment> LyricsAlignment::alignChunk(
         return transcribedWords;
     }
     
-    // Step 2: Determine search range
+    // Step 2: Use absolute time to estimate position and constrain search
+    int estimatedPosition = currentPosition;  // Default to sequential position
+    
+    if (absoluteTime > 0.0)
+    {
+        // Estimate position based on elapsed time (average 3.5 words/second for rap)
+        const double WORDS_PER_SECOND = 3.5;
+        estimatedPosition = (int)(absoluteTime * WORDS_PER_SECOND);
+        
+        // Detect large jumps (user likely skipped forward/backward)
+        int positionDelta = std::abs(estimatedPosition - currentPosition);
+        if (positionDelta > 20 && locked)
+        {
+            std::cout << "[ForceAlign] Large time jump detected (" << positionDelta 
+                     << " words) - unlocking sequence" << std::endl;
+            locked = false;
+            consecutiveMatches = 0;
+        }
+    }
+    
+    // Step 3: Determine search range
     int searchStart, searchEnd;
     
     if (!locked || currentPosition == 0)
     {
-        // Unlocked: wide search (initial or lost sync)
-        searchStart = std::max(0, currentPosition - SEARCH_WINDOW);
-        searchEnd = std::min((int)preprocessedLyrics.size(), currentPosition + SEARCH_WINDOW);
-        std::cout << "[ForceAlign] UNLOCKED - searching " << searchStart << "-" << searchEnd << std::endl;
+        // Unlocked: search around estimated position based on time
+        const int TIME_BASED_WINDOW = 30;  // ±30 words from time estimate
+        searchStart = std::max(0, estimatedPosition - TIME_BASED_WINDOW);
+        searchEnd = std::min((int)preprocessedLyrics.size(), estimatedPosition + TIME_BASED_WINDOW);
+        std::cout << "[ForceAlign] UNLOCKED - time-based search [" << searchStart << "-" << searchEnd 
+                 << "] (time=" << absoluteTime << "s, est_pos=" << estimatedPosition << ")" << std::endl;
     }
     else
     {

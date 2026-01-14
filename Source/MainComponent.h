@@ -99,6 +99,9 @@ private:
     juce::ToggleButton showRawJsonToggle;
     juce::TextButton exportLogButton;
     
+    // Testing mode toggle
+    juce::ToggleButton testingModeToggle;
+    
     // Audio Engine
     std::unique_ptr<AudioEngine> audioEngine;
     bool isProcessing = false;

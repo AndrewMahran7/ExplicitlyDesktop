@@ -94,6 +94,15 @@ public:
     bool isBufferUnderrun() const;
     
     /**
+        Enable/disable testing mode.
+        
+        When enabled, creates a log file for each song with all profanity predictions.
+        
+        @param enabled  true to enable testing mode
+    */
+    void setTestingMode(bool enabled);
+    
+    /**
         Phase 1: Get current input level (RMS).
         
         @return     RMS level 0.0-1.0
@@ -220,6 +229,7 @@ private:
     bool useLyricsAlignment = false;
     std::string lastSongTitle;
     std::string lastSongArtist;
+    double songElapsedTime = 0.0;  // Estimated position in song (seconds)
     
     // Background processing thread
     std::thread whisperThread;
@@ -263,6 +273,25 @@ private:
     
     // Quality analysis
     QualityAnalyzer qualityAnalyzer;
+    
+    // Testing mode
+    struct ProfanityPrediction
+    {
+        std::string word;
+        double timestamp;
+        std::string censorMode;
+        bool isMultiWord;
+        
+        ProfanityPrediction(const std::string& w, double t, const std::string& mode, bool multi = false)
+            : word(w), timestamp(t), censorMode(mode), isMultiWord(multi) {}
+    };
+    
+    bool testingMode = true;
+    std::vector<ProfanityPrediction> currentSongPredictions;
+    void writeTestingLog(const std::string& artist, const std::string& title);
+    
+    // Helper function to save debug WAV files
+    void saveWavFile(const std::string& filename, const std::vector<float>& samples, int sampleRate);
     
     // Runtime state
     CensorMode censorMode = CensorMode::Reverse;

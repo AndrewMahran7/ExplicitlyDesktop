@@ -106,9 +106,10 @@ public:
         the problem space.
         
         @param transcribedWords     Word segments from Whisper (2-second chunk)
+        @param absoluteTime         Estimated position in song (seconds)
         @return                     Corrected word segments using lyrics text
     */
-    std::vector<WordSegment> alignChunk(const std::vector<WordSegment>& transcribedWords);
+    std::vector<WordSegment> alignChunk(const std::vector<WordSegment>& transcribedWords, double absoluteTime = 0.0);
     
     /**
         Check if Whisper output is non-lyrical ([Music], silence, etc.)
