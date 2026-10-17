@@ -67,3 +67,16 @@ JuceLibraryCode/
 *.tmp
 *.bak
 *.cache
+
+# Explicitly Desktop runtime output (debug audio, test logs, recordings)
+DebugAudio/
+TestLogs/
+debug_*.wav
+speech.wav
+
+# Personal API keys (the app keeps these in %APPDATA%, never in the repo)
+genius_token.txt
+*.token
+
+# Windows shortcuts
+*.lnk

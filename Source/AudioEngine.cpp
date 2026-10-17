@@ -39,7 +39,7 @@ static std::string cleanTranscriptText(const std::string& text)
     // Remove parenthetical content like "( up beat music )", "(laughs)", etc.
     cleaned = std::regex_replace(cleaned, std::regex("\\([^)]*\\)"), "");
     
-    // Fix Unicode quote characters: ΓÖ¬ (U+00C3 U+0096 U+00AC) -> '
+    // Fix Unicode quote characters: Î“Ã–Â¬ (U+00C3 U+0096 U+00AC) -> '
     cleaned = std::regex_replace(cleaned, std::regex("\xC3\x96\xAC"), "'");
     
     // Fix other common Unicode issues
@@ -93,7 +93,7 @@ std::string mergeCommonSplits(const std::string& text)
         while ((pos = merged.find(split, pos)) != std::string::npos)
         {
             merged.replace(pos, split.length(), whole);
-            std::cout << "[MERGE] Fixed split word: \"" << split << "\" → \"" << whole << "\"" << std::endl;
+            std::cout << "[MERGE] Fixed split word: \"" << split << "\" â†’ \"" << whole << "\"" << std::endl;
             pos += whole.length();
         }
     }
@@ -103,6 +103,11 @@ std::string mergeCommonSplits(const std::string& text)
 
 AudioEngine::AudioEngine()
 {
+    // Leave a few cores for the audio thread and the rest of the PC
+    whisperThreads = std::max(4, std::min(16, (int) std::thread::hardware_concurrency() - 4));
+    if (auto* t = std::getenv("EXPLICITLY_WHISPER_THREADS"))
+        whisperThreads = std::max(1, std::atoi(t));
+
     // Phase 4: Load profanity filter
     juce::File lexiconFile("lexicons/profanity_en.txt");
     if (!profanityFilter.loadLexicon(lexiconFile))
@@ -114,27 +119,79 @@ AudioEngine::AudioEngine()
         std::cout << "[Phase4] Profanity filter loaded" << std::endl;
     }
     
-    // Phase 5: Load Whisper model at startup (faster "Start Processing" button response)
-    std::cout << "[Phase5] Loading Whisper model at startup..." << std::endl;
-    whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = false;  // CPU only for consistency
-    cparams.dtw_token_timestamps = true;  // Enable DTW for better timestamp alignment
-    cparams.dtw_aheads_preset = WHISPER_AHEADS_BASE_EN;  // Use base.en alignment preset
-    whisperCtx = whisper_init_from_file_with_params("Models/ggml-base.en.bin", cparams);
+    lyricsGuide = std::make_unique<LyricsGuide>(profanityFilter);
     
-    if (whisperCtx == nullptr)
+    // The CUDA build of whisper/ggml loads its backends (CUDA, CPU variants) from
+    // DLLs next to the exe; ask ggml to load them before creating any context
+#ifdef _WIN32
+    if (auto ggml = LoadLibraryA("ggml.dll"))
+        if (auto loadAll = (void (*)()) GetProcAddress(ggml, "ggml_backend_load_all"))
+            loadAll();
+#endif
+
+    // The model is loaded by start() (or loadWhisperModel); the UI picks which one.
+    // EXPLICITLY_WHISPER_MODEL overrides the default for testing
+    if (auto* m = std::getenv("EXPLICITLY_WHISPER_MODEL"))
+        whisperModelName = m;
+}
+
+const std::vector<AudioEngine::ModelChoice>& AudioEngine::availableModels()
+{
+    // Each 2s slice must be transcribed within the ~1.5s left of the 3.5s delay.
+    // Measured here: on the CPU only base.en keeps up; on an RTX 4090 all do
+    static const std::vector<ModelChoice> models = {
+        { "tiny.en",   "tiny.en - lightest load, least accurate (75 MB)" },
+        { "base.en",   "base.en - light load, fine on CPU (148 MB)" },
+        { "small.en",  "small.en - medium load, needs a GPU (488 MB)" },
+        { "medium.en", "medium.en - heaviest load, most accurate, needs a GPU (1.5 GB)" },
+    };
+    return models;
+}
+
+void AudioEngine::setWhisperModel(const std::string& name)
+{
+    bool known = false;
+    for (auto& m : availableModels())
+        known = known || m.name == name;
+    if (!known || name == whisperModelName)
+        return;
+
+    whisperModelName = name;
+    if (!isRunning && whisperCtx != nullptr)
     {
-        std::cout << "[Phase5] ERROR: Failed to load Whisper model at startup" << std::endl;
+        whisper_free(whisperCtx);   // Loaded on the next start()
+        whisperCtx = nullptr;
     }
-    else
-    {
-        std::cout << "[Phase5] Whisper base.en model loaded successfully" << std::endl;
-    }
+}
+
+bool AudioEngine::loadWhisperModel()
+{
+    if (whisperCtx != nullptr)
+        return true;
+
+    whisper_context_params cparams = whisper_context_default_params();
+    cparams.use_gpu = true;              // GPU if the CUDA backend loaded, otherwise CPU
+    cparams.flash_attn = false;          // Flash attention turns DTW off
+    cparams.dtw_token_timestamps = true; // Per-word timestamps for accurate muting
+
+    const auto& name = whisperModelName;
+    if (name == "tiny.en")        cparams.dtw_aheads_preset = WHISPER_AHEADS_TINY_EN;
+    else if (name == "base.en")   cparams.dtw_aheads_preset = WHISPER_AHEADS_BASE_EN;
+    else if (name == "small.en")  cparams.dtw_aheads_preset = WHISPER_AHEADS_SMALL_EN;
+    else                          cparams.dtw_aheads_preset = WHISPER_AHEADS_MEDIUM_EN;
+
+    std::cout << "[Phase5] Loading Whisper model " << name << "..." << std::endl;
+    whisperCtx = whisper_init_from_file_with_params(("Models/ggml-" + name + ".bin").c_str(), cparams);
+    std::cout << "[Phase5] Whisper model " << name << (whisperCtx ? " loaded" : " FAILED to load") << std::endl;
+    return whisperCtx != nullptr;
 }
 
 AudioEngine::~AudioEngine()
 {
+    *uiAlive = false;
     stop();
+    if (whisperCtx != nullptr)
+        whisper_free(whisperCtx);
 }
 
 bool AudioEngine::start(const juce::String& inputDeviceName,
@@ -202,7 +259,8 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
     std::cout << "[Phase2] Output device: " << device->getOutputChannelNames().joinIntoString(", ") << std::endl;
     std::cout << "[Phase2] ==============================" << std::endl;
     
-    // Phase 5: Check if Whisper model was loaded at startup
+    // Phase 5: Load the chosen Whisper model (kept loaded between starts)
+    loadWhisperModel();
     if (whisperCtx == nullptr)
     {
         std::cout << "[Phase5] ERROR: Whisper model not loaded - was there an error at startup?" << std::endl;
@@ -241,6 +299,29 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
     std::cout << "[Phase6] Initial positions: writePos=" << delayWritePos 
               << ", readPos=" << delayReadPos << " (playback paused until buffered)" << std::endl;
     
+    // Debug recording of input/output for timing measurements
+    debugRecordDir.clear();
+    if (auto* dir = std::getenv("EXPLICITLY_DEBUG_RECORD"))
+    {
+        debugRecordDir = dir;
+        // EXPLICITLY_DEBUG_ROLLING_SECONDS=N keeps the last N seconds instead, saved
+        // on request (POST /debug/dump on the control port)
+        int seconds = 60;
+        debugRolling = false;
+        if (auto* rolling = std::getenv("EXPLICITLY_DEBUG_ROLLING_SECONDS"))
+        {
+            seconds = juce::jlimit(10, 1800, std::atoi(rolling));
+            debugRolling = true;
+        }
+        debugInput.assign((size_t) sampleRate * seconds, 0.0f);
+        debugOutput.assign((size_t) sampleRate * seconds, 0.0f);
+        debugRecordPos = 0;
+        debugRecordFull.store(false);
+        debugRecordWritten = false;
+        std::cout << "[Debug] Recording " << seconds << "s of input/output"
+                  << (debugRolling ? " (rolling)" : "") << " to " << debugRecordDir << std::endl;
+    }
+    
     // Phase 5: Start background Whisper thread
     shouldStopThread.store(false);
     hasNewBuffer.store(false);
@@ -275,46 +356,8 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
                     });
                 }
                 
-                // Fetch lyrics ASYNCHRONOUSLY - don't block audio thread
-                if (!info.title.empty() && !info.artist.empty())
-                {
-                    std::cout << "[MediaInfo] Fetching lyrics in background..." << std::endl;
-                    
-                    // Disable alignment immediately and reset state (use raw Whisper for first ~2s)
-                    useLyricsAlignment = false;
-                    lyricsAlignment.reset();
-                    songLyrics.clear();
-                    
-                    // Copy to local variables for thread capture
-                    std::string artist = info.artist;
-                    std::string title = info.title;
-                    
-                    // Launch background thread
-                    std::thread([this, artist, title]() {
-                        std::cout << "[LyricsFetch] Background fetch started for: " 
-                                 << artist << " - " << title << std::endl;
-                        
-                        SongInfo lyricsInfo = LyricsAlignment::fetchLyrics(artist, title);
-                        
-                        // Post result back to message thread
-                        juce::MessageManager::callAsync([this, lyricsInfo]() {
-                            if (!lyricsInfo.lyrics.empty())
-                            {
-                                songLyrics = lyricsInfo.lyrics;
-                                lyricsAlignment.reset();
-                                lyricsAlignment.setLyrics(songLyrics);
-                                // useLyricsAlignment = true;  // DISABLED FOR TESTING
-                                
-                                std::cout << "[LyricsFetch] ✓ Lyrics ready! Alignment DISABLED for testing (" 
-                                         << songLyrics.length() << " chars)" << std::endl;
-                            }
-                            else
-                            {
-                                std::cout << "[LyricsFetch] ✗ No lyrics found - using raw Whisper" << std::endl;
-                            }
-                        });
-                    }).detach();
-                }
+                // Lyrics lookup and matching happen in the lyrics guide
+                lyricsGuide->setSong(info.artist, info.title);
             });
             
             // Get initial media info immediately
@@ -334,37 +377,7 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
                                    1.0f);
                 }
                 
-                // Fetch initial lyrics ASYNCHRONOUSLY
-                std::cout << "[MediaInfo] Fetching initial lyrics in background..." << std::endl;
-                useLyricsAlignment = false;  // Use raw Whisper initially
-                
-                // Copy to local variables for thread capture
-                std::string artist = initialInfo.artist;
-                std::string title = initialInfo.title;
-                
-                std::thread([this, artist, title]() {
-                    std::cout << "[LyricsFetch] Background fetch started for: " 
-                             << artist << " - " << title << std::endl;
-                    
-                    SongInfo lyricsInfo = LyricsAlignment::fetchLyrics(artist, title);
-                    
-                    juce::MessageManager::callAsync([this, lyricsInfo]() {
-                        if (!lyricsInfo.lyrics.empty())
-                        {
-                            songLyrics = lyricsInfo.lyrics;
-                            lyricsAlignment.reset();
-                            lyricsAlignment.setLyrics(songLyrics);
-                            // useLyricsAlignment = true;  // DISABLED FOR TESTING
-                            
-                            std::cout << "[LyricsFetch] ✓ Initial lyrics ready! Alignment DISABLED for testing (" 
-                                     << songLyrics.length() << " chars)" << std::endl;
-                        }
-                        else
-                        {
-                            std::cout << "[LyricsFetch] ✗ No initial lyrics found" << std::endl;
-                        }
-                    });
-                }).detach();
+                lyricsGuide->setSong(initialInfo.artist, initialInfo.title);
             }
             
             // Disable audio fingerprinting since we have Windows Media Control
@@ -384,8 +397,14 @@ bool AudioEngine::start(const juce::String& inputDeviceName,
         mediaInfoInitialized = false;
         
         // Fallback: Initialize Chromaprint + AcoustID
-        std::string fpcalcPath = "C:\\\\Users\\\\andre\\\\Desktop\\\\Explicitly\\\\chromaprint-fpcalc-1.6.0-windows-x86_64\\\\fpcalc.exe";
-        std::string acoustidKey = "bNfeKNh59F";
+        // AcoustID application key shipped with the original project (AcoustID
+        // client keys identify an app and are meant to be embedded);
+        // EXPLICITLY_ACOUSTID_KEY overrides it. Needs Chromaprint's fpcalc
+        // (EXPLICITLY_FPCALC, or fpcalc.exe next to the app)
+        const char* fpcalcEnv = std::getenv("EXPLICITLY_FPCALC");
+        const char* acoustidEnv = std::getenv("EXPLICITLY_ACOUSTID_KEY");
+        std::string fpcalcPath = fpcalcEnv != nullptr ? fpcalcEnv : "fpcalc.exe";
+        std::string acoustidKey = acoustidEnv != nullptr ? acoustidEnv : "bNfeKNh59F";
         
         if (songRecognition.initialize(fpcalcPath, acoustidKey))
         {
@@ -440,12 +459,8 @@ void AudioEngine::stop()
         std::cout << "[Phase5] Background thread stopped" << std::endl;
     }
     
-    // Cleanup Whisper
-    if (whisperCtx)
-    {
-        whisper_free(whisperCtx);
-        whisperCtx = nullptr;
-    }
+    // The Whisper model stays loaded so Start works again after Stop (it is freed
+    // in the destructor, or when a different model is picked)
     
     isRunning = false;
     
@@ -508,6 +523,51 @@ double AudioEngine::getCurrentBufferSize() const
     return (double)gap / sampleRate;
 }
 
+void AudioEngine::setFilterEnabled(bool enabled)
+{
+    filterEnabled.store(enabled);
+    std::cout << "[Filter] Filter Explicit Speech " << (enabled ? "ON" : "OFF") << std::endl;
+}
+
+AudioEngine::FilterStatus AudioEngine::getFilterStatus() const
+{
+    FilterStatus status;
+    status.running = isRunning.load();
+    status.enabled = filterEnabled.load();
+    status.bypassed = status.enabled && isBypassed();
+
+    if (status.running && status.enabled && !status.bypassed)
+    {
+        status.buffering = !playbackStarted.load() || outputPaused.load();
+        // While buffering, output is silent and will start at the target delay
+        status.delaySeconds = status.buffering ? initialDelaySeconds : getCurrentBufferSize();
+    }
+
+    return status;
+}
+
+bool AudioEngine::dumpDebugRecording()
+{
+    if (debugRecordDir.empty() || !debugRolling || debugInput.empty())
+        return false;
+
+    // Oldest sample first (the ring keeps being written meanwhile; fine for debugging)
+    size_t size = debugInput.size();
+    size_t pos = debugRecordPos;
+    size_t count = std::min(pos, size);
+    std::vector<float> in(count), out(count);
+    for (size_t k = 0; k < count; ++k)
+    {
+        size_t at = (pos - count + k) % size;
+        in[k] = debugInput[at];
+        out[k] = debugOutput[at];
+    }
+    saveWavFile(debugRecordDir + "/debug_input.wav", in, sampleRate);
+    saveWavFile(debugRecordDir + "/debug_output.wav", out, sampleRate);
+    std::cout << "[Debug] Dumped last " << (double) count / sampleRate << "s of input/output" << std::endl;
+    return true;
+}
+
 bool AudioEngine::isBufferUnderrun() const
 {
     return bufferUnderrun.load();
@@ -535,6 +595,7 @@ void AudioEngine::audioDeviceAboutToStart(juce::AudioIODevice* device)
     transcriptionInterval = 0;
     streamTime = 0.0;
     playbackStarted = false;  // Track when we start playing
+    outputPaused = false;
     wasWaiting = false;
     debugCounter = 0;
     
@@ -678,8 +739,14 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
     // Send chunks with configurable overlap between them
     transcriptionInterval += numSamples;
     
+    // Filter off: don't spend GPU time transcribing audio that plays uncensored
+    if (!filterActive())
+    {
+        bufferWritePos = 0;
+        transcriptionInterval = 0;
+    }
     // Send to Whisper if: (1) we have chunkSeconds of audio, AND (2) Whisper is ready for more
-    if (transcriptionInterval >= (sampleRate * chunkSeconds) && !hasNewBuffer.load())
+    else if (transcriptionInterval >= (sampleRate * chunkSeconds) && !hasNewBuffer.load())
     {
         // Phase 5: Signal background thread (it's ready for next chunk)
         {
@@ -694,6 +761,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
             // This marks where the END of the chunk is in the delay buffer
             // The chunk starts chunkSeconds before this position
             bufferCaptureTime = (double)delayWritePos;  // Store END position of chunk
+            bufferCaptureSamples = samplesCaptured.load();
             
             int chunkStartPos = (delayWritePos - (int)(sampleRate * chunkSeconds) + delayBufferSize) % delayBufferSize;
             std::cout << "[CAPTURE] Sending chunk to Whisper | chunkStart=" << chunkStartPos 
@@ -760,6 +828,38 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
         lastUnderrunWarningTime = streamTime;
     }
     
+    // Filter Explicit Speech toggle: when off, pass input straight through with no
+    // delay. The read position tracks the write position so that turning the filter
+    // back on starts a fresh initialDelaySeconds fill (heard as a short silence).
+    if (!filterActive())
+    {
+        for (int i = 0; i < numSamples; ++i)
+        {
+            for (int ch = 0; ch < std::min(2, numInputChannels); ++ch)
+                if (inputChannelData[ch] != nullptr)
+                    delayBuffer[ch][delayWritePos] = inputChannelData[ch][i];
+
+            for (int ch = 0; ch < numOutputChannels; ++ch)
+            {
+                if (outputChannelData[ch] == nullptr)
+                    continue;
+                int inCh = std::min(ch, numInputChannels - 1);
+                outputChannelData[ch][i] = (inCh >= 0 && inputChannelData[inCh] != nullptr)
+                                               ? inputChannelData[inCh][i] : 0.0f;
+            }
+
+            delayWritePos = (delayWritePos + 1) % delayBufferSize;
+        }
+
+        delayReadPos = delayWritePos;
+        samplesCaptured += numSamples;
+        playbackStarted.store(false);
+        outputPaused.store(false);
+        bufferUnderrun.store(false);
+        streamTime += (double)numSamples / sampleRate;
+        return;
+    }
+
     // Phase 6: Write input to delay buffer, read from 10 seconds ago
     for (int i = 0; i < numSamples; ++i)
     {
@@ -787,31 +887,32 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
             if (canPlay)
             {
                 playbackStarted.store(true);
-                std::cout << "\n[Phase6] ✓ " << initialDelaySeconds << " SECONDS BUFFERED - PLAYBACK STARTING NOW!" << std::endl;
+                std::cout << "\n[Phase6] âœ“ " << initialDelaySeconds << " SECONDS BUFFERED - PLAYBACK STARTING NOW!" << std::endl;
                 std::cout << "[Phase6] Censored audio will now be audible\n" << std::endl;
             }
         }
         else
         {
             // Dynamic buffering: pause if too low, resume when recovered
-            static bool wasPaused = false;
-            
+            bool wasPaused = outputPaused.load();
+
             double pauseThreshold = initialDelaySeconds - 2.0;  // Pause at initialDelaySeconds - 2s
             double resumeThreshold = initialDelaySeconds;       // Resume at initialDelaySeconds
             
             if (bufferSeconds < pauseThreshold && !wasPaused)
             {
                 wasPaused = true;
-                std::cout << "\n[Phase6] ⚠ Buffer dropped to " << std::fixed << std::setprecision(2) 
+                std::cout << "\n[Phase6] âš  Buffer dropped to " << std::fixed << std::setprecision(2) 
                          << bufferSeconds << "s - PAUSING playback to rebuild buffer\n" << std::endl;
             }
             else if (bufferSeconds >= resumeThreshold && wasPaused)
             {
                 wasPaused = false;
-                std::cout << "\n[Phase6] ✓ Buffer recovered to " << std::fixed << std::setprecision(2) 
+                std::cout << "\n[Phase6] âœ“ Buffer recovered to " << std::fixed << std::setprecision(2) 
                          << bufferSeconds << "s - RESUMING playback\n" << std::endl;
             }
             
+            outputPaused.store(wasPaused);
             canPlay = !wasPaused;
         }
         
@@ -832,6 +933,15 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
             }
         }
         
+        if (!debugRecordDir.empty() && (debugRolling || debugRecordPos < debugInput.size()))
+        {
+            size_t at = debugRecordPos % debugInput.size();
+            debugInput[at] = inputChannelData[0] != nullptr ? inputChannelData[0][i] : 0.0f;
+            debugOutput[at] = outputChannelData[0] != nullptr ? outputChannelData[0][i] : 0.0f;
+            if (++debugRecordPos == debugInput.size() && !debugRolling)
+                debugRecordFull.store(true);
+        }
+        
         // Always advance write position
         delayWritePos = (delayWritePos + 1) % delayBufferSize;
         
@@ -844,6 +954,7 @@ void AudioEngine::audioDeviceIOCallbackWithContext(const float* const* inputChan
     
     // Update stream time (tracks the DELAYED output time)
     streamTime += (double)numSamples / sampleRate;
+    samplesCaptured += numSamples;
     
     if (currentCount == 0)
         std::cout << "[Phase6] Audio passthrough + censorship active" << std::endl;
@@ -875,6 +986,7 @@ void AudioEngine::whisperThreadFunction()
             // Copy to local buffer BEFORE releasing lock
             std::copy(processingBuffer.begin(), processingBuffer.end(), localBuffer.begin());
             double captureTime = bufferCaptureTime;  // Copy timestamp
+            captureStreamSeconds = (double) bufferCaptureSamples / sampleRate;
             hasNewBuffer.store(false);
             
             // NOW release the lock - audio callback can write new data safely
@@ -970,7 +1082,7 @@ void AudioEngine::writeTestingLog(const std::string& artist, const std::string& 
     
     logFile.close();
     
-    std::cout << "[Testing] ✓ Log file created: " << filename << std::endl;
+    std::cout << "[Testing] âœ“ Log file created: " << filename << std::endl;
     std::cout << "[Testing]   Predictions logged: " << currentSongPredictions.size() << std::endl;
     std::cout << "[Testing]   Full path: " << filename << std::endl;
 }
@@ -1005,6 +1117,14 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
     if (!whisperCtx)
         return;
     
+    if (debugRecordFull.load() && !debugRecordWritten)
+    {
+        debugRecordWritten = true;
+        saveWavFile(debugRecordDir + "/debug_input.wav", debugInput, sampleRate);
+        saveWavFile(debugRecordDir + "/debug_output.wav", debugOutput, sampleRate);
+        std::cout << "[Debug] Wrote debug_input.wav and debug_output.wav" << std::endl;
+    }
+    
     try
     {
         // Calculate delay duration for timestamp calculation
@@ -1027,9 +1147,27 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         qualityAnalyzer.recordBufferSize(currentBufferSize);
         
         // Phase 5: Process the buffer passed as parameter (already a local copy in thread)
-        int samplesToProcess = (int)(sampleRate * chunkSeconds);
-        samplesToProcess = std::min(samplesToProcess, (int)buffer.size());
-        std::vector<float> bufferCopy(buffer.begin(), buffer.begin() + samplesToProcess);
+        // Transcribe the new chunk plus overlapSeconds of the audio before it, read
+        // straight from the delay buffer, so words cut by a chunk boundary are
+        // heard whole in the next window
+        const double windowSeconds = chunkSeconds + overlapSeconds;
+        
+        // DTW marks each token near where it finishes, so a word's first-token time
+        // is late for its start, and its last-token time is just before its end.
+        // Measured on medium.en with a test clip of known word positions
+        // (EXPLICITLY_DEBUG_RECORD): starts +0.24..+0.33s late; ending words at the
+        // next word's start instead clipped the following word in songs.
+        const double startBias = -0.25;   // Lets the first consonant through
+        const double dtwEndOffset = 0.13;   // Word end after its last token's DTW time
+        const int windowSamples = (int)(sampleRate * windowSeconds);
+        const int windowStartPos = ((int)captureTime - windowSamples + delayBufferSize) % delayBufferSize;
+        std::vector<float> bufferCopy((size_t) windowSamples);
+        for (int i = 0; i < windowSamples; ++i)
+        {
+            int pos = (windowStartPos + i) % delayBufferSize;
+            bufferCopy[(size_t) i] = 0.5f * (delayBuffer[0][pos] + delayBuffer[1][pos]);
+        }
+        juce::ignoreUnused(buffer);
         
         // DISABLED: Vocal filtering may be degrading audio quality for Whisper
         // vocalFilter.processBuffer(bufferCopy);
@@ -1053,7 +1191,7 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
             std::cout << "[DEBUG] Saved " << filename << " for inspection" << std::endl;
         }
         
-        std::cout << "[Phase5] Resampled " << samplesToProcess << " samples to " 
+        std::cout << "[Phase5] Resampled " << windowSamples << " samples to " 
                   << audioBuffer16k.size() << " samples @ 16kHz" << std::endl;
         
         // Configure Whisper parameters - OPTIMIZED FOR SPEED
@@ -1064,9 +1202,9 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         wparams.print_special = false;
         wparams.translate = false;
         wparams.language = "en";
-        wparams.n_threads = 8;  // Increase threads (use all CPU cores)
+        wparams.n_threads = whisperThreads;
         wparams.single_segment = false;
-        wparams.token_timestamps = false;
+        wparams.token_timestamps = true;   // Second timing estimate besides DTW
         wparams.max_len = 0;
         
         // Speed optimizations (valid parameters only)
@@ -1075,6 +1213,14 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         wparams.temperature_inc = 0.2f;  // Try multiple decoding strategies (0, 0.2, 0.4, 0.6, 0.8, 1.0)
         wparams.entropy_thold = 5.0f;  // Don't skip uncertain segments (music has high entropy)
         wparams.logprob_thold = -1.0f;  // Accept lower probability tokens (faster)
+        
+        // Over loud music Whisper often answers "(upbeat music)". Suppress those
+        // non-speech tokens, and when the song's lyrics are known, prompt with the
+        // lines around where we are so it hears the sung words
+        wparams.suppress_nst = true;
+        std::string lyricsPrompt = lyricsGuide->getPrompt();
+        if (!lyricsPrompt.empty())
+            wparams.initial_prompt = lyricsPrompt.c_str();
         
         // Run transcription
         int result = whisper_full(whisperCtx, wparams, audioBuffer16k.data(), (int)audioBuffer16k.size());
@@ -1089,157 +1235,103 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         // Without this, KV cache grows indefinitely and RTF increases over time
         whisper_reset_timings(whisperCtx);
         
-        // Extract word-level segments using SEGMENT timestamps (more reliable than token timestamps)
+        // Extract words with per-token DTW timestamps (enabled on the context via
+        // dtw_token_timestamps). Tokens are sub-words, so tokens are grouped into
+        // words at leading spaces. A word runs from its first token's DTW time to
+        // the next word's first token. Falls back to spreading words evenly over
+        // the segment if DTW times are unavailable.
         int numSegments = whisper_full_n_segments(whisperCtx);
         std::vector<WordSegment> transcribedWords;
+        bool allDtw = true;
         
-        std::cout << "[Phase6] Using segment-level timestamps (token timestamps unreliable)" << std::endl;
+        struct PendingWord { std::string text; double start; double last; double ts0; double ts1; };
+        std::vector<std::pair<double, double>> tokenTimes;   // Per word: token-timestamp start/end
         
         for (int i = 0; i < numSegments; ++i)
         {
-            // Get segment-level timestamps (these are accurate!)
-            int64_t segmentStart = whisper_full_get_segment_t0(whisperCtx, i);
-            int64_t segmentEnd = whisper_full_get_segment_t1(whisperCtx, i);
-            double segStartSec = segmentStart * 0.01;  // centiseconds to seconds
-            double segEndSec = segmentEnd * 0.01;
+            double segStartSec = whisper_full_get_segment_t0(whisperCtx, i) * 0.01;
+            double segEndSec = whisper_full_get_segment_t1(whisperCtx, i) * 0.01;
             
-            // Get all tokens in this segment
+            std::vector<PendingWord> words;
+            bool haveDtw = true;
+            
             int numTokens = whisper_full_n_tokens(whisperCtx, i);
-            std::vector<std::string> segmentWords;
-            
             for (int j = 0; j < numTokens; ++j)
             {
                 whisper_token_data token = whisper_full_get_token_data(whisperCtx, i, j);
-                
-                // Skip special tokens
                 if (token.id >= whisper_token_eot(whisperCtx))
+                    continue;  // Special tokens
+                
+                std::string raw = whisper_full_get_token_text(whisperCtx, i, j);
+                bool startsWord = words.empty() || (! raw.empty() && raw[0] == ' ');
+                std::string piece = cleanTranscriptText(raw);
+                if (piece.empty())
                     continue;
                 
-                const char* tokenText = whisper_full_get_token_text(whisperCtx, i, j);
-                std::string word = cleanTranscriptText(tokenText);
+                if (token.t_dtw < 0)
+                    haveDtw = false;
                 
-                if (!word.empty())
-                    segmentWords.push_back(word);
-            }
-            
-            // Distribute words evenly across segment duration
-            if (!segmentWords.empty())
-            {
-                double segmentDuration = segEndSec - segStartSec;
-                double wordDuration = segmentDuration / segmentWords.size();
-                
-                for (size_t k = 0; k < segmentWords.size(); ++k)
+                if (startsWord)
+                    words.push_back({ piece, token.t_dtw * 0.01, token.t_dtw * 0.01, token.t0 * 0.01, token.t1 * 0.01 });
+                else
                 {
-                    double wordStart = segStartSec + (k * wordDuration);
-                    double wordEnd = wordStart + wordDuration;
-                    
-                    // Clamp to 0-5 second range
-                    wordStart = std::max(0.0, std::min(5.0, wordStart));
-                    wordEnd = std::max(wordStart + 0.05, std::min(5.0, wordEnd));
-                    
-                    transcribedWords.emplace_back(
-                        segmentWords[k],
-                        wordStart,
-                        wordEnd,
-                        0.9f  // Confidence (not available at segment level)
-                    );
+                    words.back().text += piece;
+                    words.back().last = token.t_dtw * 0.01;
+                    words.back().ts1 = token.t1 * 0.01;
                 }
             }
+            
+            allDtw = allDtw && haveDtw;
+            for (size_t k = 0; k < words.size(); ++k)
+            {
+                double wordStart, wordEnd;
+                if (haveDtw)
+                {
+                    // DTW marks each token near where it finishes: the word ends just
+                    // after its last token's time (never past the next word's start)
+                    wordStart = words[k].start;
+                    wordEnd = words[k].last + dtwEndOffset;
+                    if (k + 1 < words.size())
+                        wordEnd = std::min(wordEnd, words[k + 1].start);
+                }
+                else
+                {
+                    double wordDuration = (segEndSec - segStartSec) / words.size();
+                    wordStart = segStartSec + k * wordDuration;
+                    wordEnd = wordStart + wordDuration;
+                }
+                
+                wordStart = std::max(0.0, std::min(windowSeconds, wordStart));
+                wordEnd = std::max(wordStart + 0.05, std::min(windowSeconds, wordEnd));
+                transcribedWords.emplace_back(words[k].text, wordStart, wordEnd, 0.9f);
+                tokenTimes.push_back({ words[k].ts0, words[k].ts1 });
+            }
         }
         
-        std::cout << "[Phase5] Extracted " << transcribedWords.size() << " word segments" << std::endl;
-        
-        // Phase 6: Refine timestamps using audio energy analysis
-        std::cout << "[Phase6] Refining timestamps..." << std::endl;
-        for (auto& word : transcribedWords)
-        {
-            timestampRefiner.refineWordTimestamp(word, bufferCopy, sampleRate);
-        }
+        std::cout << "[Phase5] Extracted " << transcribedWords.size() << " words ("
+                  << (allDtw ? "DTW timestamps" : "spread over segment") << ")" << std::endl;
         
         // Apply lyrics alignment if enabled (sliding window approach)
         std::vector<WordSegment> finalWords = transcribedWords;
         
-        // Periodic song change detection (works with or without lyrics)
-        static auto lastPeriodicCheck = std::chrono::steady_clock::now();
+        // Follow what's playing (Spotify, browsers) every few seconds; the lyrics
+        // guide ignores repeats and looks up lyrics for new songs in the background
+        static auto lastMediaPoll = std::chrono::steady_clock::now() - std::chrono::seconds(10);
         auto now = std::chrono::steady_clock::now();
-        auto timeSinceLastCheck = std::chrono::duration_cast<std::chrono::seconds>(now - lastPeriodicCheck).count();
-        
-        bool shouldCheckForNewSong = false;
-        
-        if (useLyricsAlignment && !songLyrics.empty())
+        // EXPLICITLY_DEBUG_SONG="Artist|Title" pins the song (for testing with clips
+        // that don't show up in Windows' now-playing info)
+        static const char* debugSong = std::getenv("EXPLICITLY_DEBUG_SONG");
+        if (debugSong != nullptr)
         {
-            std::cout << "[Phase5] Applying lyrics alignment with sliding window..." << std::endl;
-            
-            // Check if we're near end of lyrics (auto-queued song detection)
-            if (lyricsAlignment.isReady())
-            {
-                int currentPos = lyricsAlignment.getCurrentPosition();
-                int totalWords = lyricsAlignment.getTotalWords();
-                
-                // If we're in the last 10% of lyrics, check if a new song is playing
-                if (totalWords > 0 && currentPos >= (totalWords * 0.90))
-                {
-                    // Check every 3 seconds when near end
-                    if (timeSinceLastCheck >= 3 && mediaInfoInitialized)
-                    {
-                        std::cout << "[EndOfSong] Near lyrics end (" << currentPos << "/" << totalWords 
-                                 << ") - checking for queued song..." << std::endl;
-                        shouldCheckForNewSong = true;
-                    }
-                }
-            }
+            juce::String pinned(debugSong);
+            lyricsGuide->setSong(pinned.upToFirstOccurrenceOf("|", false, false).toStdString(),
+                                 pinned.fromFirstOccurrenceOf("|", false, false).toStdString());
         }
-        else
+        else if (mediaInfoInitialized && now - lastMediaPoll >= std::chrono::seconds(3))
         {
-            // No lyrics loaded - check periodically (every 10 seconds)
-            // This handles songs without lyrics or failed lyrics fetches
-            if (timeSinceLastCheck >= 10 && mediaInfoInitialized)
-            {
-                std::cout << "[PeriodicCheck] No lyrics active - checking for song change..." << std::endl;
-                shouldCheckForNewSong = true;
-            }
-        }
-        
-        // Execute song change detection if triggered
-        if (shouldCheckForNewSong)
-        {
-            auto currentMedia = windowsMediaInfo.getCurrentMedia();
-            if (!currentMedia.title.empty())
-            {
-                // Check if this is a different song (basic title comparison)
-                if (currentMedia.title != lastSongTitle || currentMedia.artist != lastSongArtist)
-                {
-                    std::cout << "[SongChange] New song detected! " << currentMedia.artist 
-                             << " - " << currentMedia.title << std::endl;
-                    
-                    // Testing mode: Write log file for previous song before switching
-                    // Launch background lyrics fetch
-                    std::string artist = currentMedia.artist;
-                    std::string title = currentMedia.title;
-                    
-                    std::thread([this, artist, title]() {
-                        SongInfo lyricsInfo = LyricsAlignment::fetchLyrics(artist, title);
-                        
-                        juce::MessageManager::callAsync([this, lyricsInfo]() {
-                            if (!lyricsInfo.lyrics.empty())
-                            {
-                                songLyrics = lyricsInfo.lyrics;
-                                lyricsAlignment.reset();
-                                lyricsAlignment.setLyrics(songLyrics);
-                                // useLyricsAlignment = true;  // DISABLED FOR TESTING
-                                
-                                std::cout << "[SongChange] ✓ New song lyrics loaded! (ALIGNMENT DISABLED)" << std::endl;
-                            }
-                            else
-                            {
-                                std::cout << "[SongChange] ✗ No lyrics found for new song - using raw Whisper" << std::endl;
-                            }
-                        });
-                    }).detach();
-                }
-            }
-            
-            lastPeriodicCheck = now;
+            lastMediaPoll = now;
+            auto media = windowsMediaInfo.getCurrentMedia();
+            lyricsGuide->setSong(media.artist, media.title);
         }
         
         if (useLyricsAlignment && !songLyrics.empty())
@@ -1255,7 +1347,7 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
             // BUGFIX: If alignment returns empty (no match), fall back to raw Whisper
             if (finalWords.empty() && !transcribedWords.empty())
             {
-                std::cout << "[Phase5] ⚠ Alignment returned empty - falling back to raw Whisper" << std::endl;
+                std::cout << "[Phase5] âš  Alignment returned empty - falling back to raw Whisper" << std::endl;
                 finalWords = transcribedWords;
             }
             
@@ -1297,37 +1389,14 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
         std::string fullTranscript;
         std::vector<std::string> detectedWords;
         
-        // Send raw Whisper transcription to UI (for comparison)
-        if (lyricsCallback && !transcribedWords.empty())
-        {
-            juce::String whisperWords;
-            for (const auto& wordSeg : transcribedWords)
-            {
-                whisperWords += juce::String(wordSeg.word) + " ";
-            }
-            
-            // Call on message thread
-            juce::MessageManager::callAsync([this, whisperWords]() {
-                if (lyricsCallback)
-                    lyricsCallback(whisperWords.trim());
-            });
-        }
+        // Check Whisper's words against the song's lyrics, when we have them
+        LyricsGuide::Decision guide;
+        if (!useLyricsAlignment)
+            guide = lyricsGuide->analyze(finalWords, windowSeconds, startBias,
+                                         captureStreamSeconds - windowSeconds);
         
-        // Send corrected/aligned lyrics to UI (actual lyrics)
-        if (actualLyricsCallback && !finalWords.empty())
-        {
-            juce::String correctedWords;
-            for (const auto& wordSeg : finalWords)
-            {
-                correctedWords += juce::String(wordSeg.word) + " ";
-            }
-            
-            // Call on message thread
-            juce::MessageManager::callAsync([this, correctedWords]() {
-                if (actualLyricsCallback)
-                    actualLyricsCallback(correctedWords.trim());
-            });
-        }
+        struct Hit { std::string text; double start; double end; bool multi; bool finalTimes = false; };
+        std::vector<Hit> hits;
         
         // Check for single-word AND multi-word profanity
         std::vector<bool> wordAlreadyCensored(finalWords.size(), false);  // Track which words are already handled
@@ -1383,8 +1452,129 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                 }
             }
             
-            // Process the detected profanity (single or multi-word)
+            // Lyrics say a clean word is sung here: Whisper misheard, don't mute
+            if (foundProfanity && guide.aligned && guide.lyricsSayClean[idx]
+                && (!isMultiWord || guide.lyricsSayClean[idx + 1]))
+            {
+                std::cout << "[LyricsGuide] Not muting \"" << profanityText
+                          << "\": lyrics have a clean word here" << std::endl;
+                continue;
+            }
+            
             if (foundProfanity)
+            {
+                if (idx < tokenTimes.size())
+                    std::cout << "[Timing] \"" << profanityText << "\" dtw " << profanityStart << "-" << profanityEnd
+                              << " token-ts " << tokenTimes[idx].first << "-"
+                              << tokenTimes[std::min(tokenTimes.size() - 1, idx + (isMultiWord ? 1 : 0))].second
+                              << " window-start-abs "
+                              << (double)((long long) debugRecordPos - (long long)((delayWritePos - windowStartPos + delayBufferSize) % delayBufferSize)) / sampleRate
+                              << std::endl;
+                hits.push_back({ profanityText, profanityStart, profanityEnd, isMultiWord });
+            }
+        }
+        
+        // Profane lyrics words that Whisper misheard or missed
+        for (size_t k = 0; k < guide.extraMutes.size(); ++k)
+        {
+            std::cout << "[LyricsGuide] Muting from lyrics: " << guide.extraMuteWords[k] << std::endl;
+            hits.push_back({ guide.extraMuteWords[k], guide.extraMutes[k].first, guide.extraMutes[k].second, false,
+                             guide.extraMuteIsFinal[k] });
+        }
+        
+        // Displays. Audio at offset t in this window is heard (gap - (window - t))
+        // after capture; transcription has already used `elapsed` of that.
+        {
+            double elapsed = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - startTime).count();
+            double gap = getCurrentBufferSize();
+            auto msUntilHeard = [&](double t) {
+                return juce::jmax(0, (int)((gap - (windowSeconds - t) - elapsed) * 1000.0));
+            };
+            auto alive = uiAlive;
+            
+            // "Whisper Heard": what was heard in the new part of the window, shown
+            // as its middle plays
+            juce::String heard;
+            for (const auto& wordSeg : transcribedWords)
+                if (wordSeg.start >= overlapSeconds)
+                    heard += juce::String(wordSeg.word) + " ";
+            heard = heard.trim();
+            if (heard.removeCharacters(" ").equalsIgnoreCase("BLANKAUDIO"))   // Whisper's [BLANK_AUDIO]
+                heard = {};
+            
+            if (heard.isNotEmpty())
+            {
+                int waitMs = msUntilHeard(overlapSeconds + chunkSeconds / 2.0);
+                juce::MessageManager::callAsync([this, alive, heard, waitMs]() {
+                    juce::Timer::callAfterDelay(waitMs, [this, alive, heard]() {
+                        if (*alive && lyricsCallback)
+                            lyricsCallback(heard);
+                    });
+                });
+            }
+            
+            // "Actual Lyrics", karaoke style: each lyric line appears a moment before
+            // it is sung, with the previous line above and the next two below
+            const double karaokeLeadSeconds = 0.6;
+            if (guide.songGeneration != lastCueGeneration)
+            {
+                lastCueGeneration = guide.songGeneration;
+                lastCuedLine = -1;
+                lastCueTime = -1.0;
+            }
+            const double windowStreamStart = captureStreamSeconds - windowSeconds;
+            
+            for (const auto& cue : guide.lineCues)
+            {
+                // In order of when they are heard: the overlap's repeats are
+                // dropped, but a corrected match (even to an earlier line) shows
+                double cueTime = windowStreamStart + cue.start;
+                if (cue.line == lastCuedLine || cueTime < lastCueTime + 0.5)
+                    continue;
+                lastCuedLine = cue.line;
+                lastCueTime = cueTime;
+                
+                // Four lines: previous, current, next, the one after (the panel
+                // highlights the second)
+                juce::String text;
+                text << cue.previous << "\n" << cue.text << "\n" << cue.next << "\n" << cue.afterNext;
+                
+                int waitMs = juce::jmax(0, msUntilHeard(cue.start) - (int)(karaokeLeadSeconds * 1000.0));
+                std::cout << "[Karaoke] line " << cue.line << " in " << waitMs << "ms" << std::endl;
+                int line = cue.line;
+                juce::MessageManager::callAsync([this, alive, text, waitMs, line]() {
+                    juce::Timer::callAfterDelay(waitMs, [this, alive, text, line]() {
+                        if (!*alive)
+                            return;
+                        if (!debugRecordDir.empty())
+                            std::cout << "[Karaoke] showing line " << line << " at output "
+                                      << (double) debugRecordPos / sampleRate << "s" << std::endl;
+                        if (actualLyricsCallback)
+                            actualLyricsCallback(text);
+                    });
+                });
+            }
+            
+            // No lyrics for this song: show Whisper's words there instead
+            if (!lyricsGuide->getStatus().hasLyrics && heard.isNotEmpty())
+            {
+                int waitMs = msUntilHeard(overlapSeconds);
+                juce::MessageManager::callAsync([this, alive, heard, waitMs]() {
+                    juce::Timer::callAfterDelay(waitMs, [this, alive, heard]() {
+                        if (*alive && actualLyricsCallback)
+                            actualLyricsCallback(heard);
+                    });
+                });
+            }
+        }
+        
+        // Process the detected profanity (single or multi-word)
+        for (const auto& hit : hits)
+        {
+            const std::string& profanityText = hit.text;
+            double profanityStart = hit.start;
+            double profanityEnd = hit.end;
+            bool isMultiWord = hit.multi;
             {
                 // Skip censorship if buffer is critically low (emergency bypass)
                 if (bufferUnderrun.load())
@@ -1414,23 +1604,64 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                 // wordSeg.start/end are offsets from CHUNK START (0-chunkSeconds)
                 // So: chunkStart = captureTime - chunkSeconds, profanityPos = chunkStart + offset
                 int chunkEndPos = (int)captureTime;
-                int chunkStartPos = (chunkEndPos - (int)(sampleRate * chunkSeconds) + delayBufferSize) % delayBufferSize;
+                int chunkStartPos = windowStartPos;
+                juce::ignoreUnused(chunkEndPos);
                 
-                // Tiny model tends to timestamp late - use asymmetric padding
-                double paddingBefore = 0.4;  // 400ms before word (catch early starts)
-                double paddingAfter = 0.1;   // 100ms after word (tight end)
+                // Correct Whisper's late word starts (startBias, above) and pad a little
+                // Keep mutes tight: a leading "f" sound is fine, a muted neighbour
+                // word is not
+                double paddingBefore = 0.0;
+                double paddingAfter = 0.08;
                 
-                int startSample = (int)((profanityStart - paddingBefore) * sampleRate);
-                int endSample = (int)((profanityEnd + paddingAfter) * sampleRate);
+                // Words the lyrics placed for us are already in real time
+                double bias = hit.finalTimes ? 0.0 : startBias;
+                double padBefore = hit.finalTimes ? 0.0 : paddingBefore;
+                double padAfter = hit.finalTimes ? 0.0 : paddingAfter;
                 
-                // Clamp to valid range (0 to chunkSeconds)
-                int maxSample = (int)(sampleRate * chunkSeconds);
+                int startSample = (int)((profanityStart + bias - padBefore) * sampleRate);
+                int endSample = (int)((profanityEnd + padAfter) * sampleRate);
+                
+                // Clamp to the chunk, allowing a little past its end for the padding
+                // (that audio has arrived by the time transcription finishes)
+                int maxSample = windowSamples + (int)(sampleRate * 0.2);
                 startSample = std::max(0, std::min(startSample, maxSample));
                 endSample = std::max(startSample, std::min(endSample, maxSample));
                 
                 // Calculate actual buffer positions we'll modify
                 int actualStartPos = (chunkStartPos + startSample) % delayBufferSize;
                 int actualEndPos = (chunkStartPos + endSample) % delayBufferSize;
+                
+                // Windows overlap, so the same word can be found twice. Censor each
+                // stretch once (reversing twice would play it forwards again)
+                {
+                    int newLen = endSample - startSample;
+                    bool alreadyDone = false;
+                    
+                    // Only the previous window can repeat a word; older entries would
+                    // alias once the circular delay buffer wraps
+                    auto nowTime = std::chrono::steady_clock::now();
+                    recentCensors.erase(std::remove_if(recentCensors.begin(), recentCensors.end(),
+                        [nowTime](const CensorRecord& r) { return nowTime - r.when > std::chrono::seconds(4); }),
+                        recentCensors.end());
+                    
+                    for (const auto& done : recentCensors)
+                    {
+                        int offset = (actualStartPos - done.pos + delayBufferSize) % delayBufferSize;
+                        int back = (done.pos - actualStartPos + delayBufferSize) % delayBufferSize;
+                        int overlap = offset < done.length ? std::min(newLen, done.length - offset)
+                                    : (back < newLen ? std::min(done.length, newLen - back) : 0);
+                        if (overlap > newLen * 3 / 10)
+                            alreadyDone = true;
+                    }
+                    // The next window often finds the same word with a slightly
+                    // different time; muting both made one word's mute longer
+                    if (alreadyDone)
+                    {
+                        std::cout << "[Phase6] \"" << profanityText << "\" already censored (overlap)" << std::endl;
+                        continue;
+                    }
+                    recentCensors.push_back({ actualStartPos, newLen, nowTime });
+                }
                 int currentReadPos = delayReadPos;  // Snapshot current read position
                 
                 // Calculate how far ahead of readPos we are
@@ -1452,7 +1683,7 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                 
                 if (secondsAhead < 1.0)
                 {
-                    std::cout << "[Phase6]     ⚠️ WARNING: Too close to readPos! Censorship may be late!" << std::endl;
+                    std::cout << "[Phase6]     âš ï¸ WARNING: Too close to readPos! Censorship may be late!" << std::endl;
                 }
                 
                 // Apply censorship based on mode
@@ -1470,7 +1701,7 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                             delayBuffer[ch][delayPos] = 0.0f;
                         }
                     }
-                    std::cout << "[Phase6]     ✓ MUTED in delay buffer" << std::endl;
+                    std::cout << "[Phase6]     âœ“ MUTED in delay buffer" << std::endl;
                 }
                 else if (currentCensorMode == CensorMode::Reverse)
                 {
@@ -1514,7 +1745,7 @@ void AudioEngine::processTranscription(const std::vector<float>& buffer, double 
                             delayBuffer[ch][delayPos] = sample;
                         }
                     }
-                    std::cout << "[Phase6]     ✓ REVERSED in delay buffer" << std::endl;
+                    std::cout << "[Phase6]     âœ“ REVERSED in delay buffer" << std::endl;
                 }
             }
         }

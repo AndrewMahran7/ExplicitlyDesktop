@@ -26,6 +26,7 @@
 #include <juce_audio_devices/juce_audio_devices.h>
 #include <whisper.h>
 #include <atomic>
+#include <chrono>
 #include <vector>
 #include <thread>
 #include "QualityAnalyzer.h"
@@ -37,6 +38,7 @@
 #include "TimestampRefiner.h"
 #include "SongRecognition.h"
 #include "WindowsMediaInfo.h"
+#include "LyricsGuide.h"
 #include "Types.h"
 
 class AudioEngine : public juce::AudioIODeviceCallback
@@ -50,6 +52,13 @@ public:
     
     AudioEngine();
     ~AudioEngine() override;
+
+    struct ModelChoice { std::string name; std::string label; };
+    /** Whisper models in Models/, lightest first, labelled by performance impact. */
+    static const std::vector<ModelChoice>& availableModels();
+    /** Pick the model to use; takes effect on the next start(). */
+    void setWhisperModel(const std::string& name);
+    const std::string& getWhisperModel() const { return whisperModelName; }
     
     /**
         Start audio processing.
@@ -92,7 +101,71 @@ public:
         @return     true if buffer is critically low
     */
     bool isBufferUnderrun() const;
+
+    /** Debug: save the rolling input/output recording (EXPLICITLY_DEBUG_ROLLING_SECONDS). */
+    bool dumpDebugRecording();
+
+    /**
+        Filter Explicit Speech toggle. Safe to call from any thread.
+
+        When off, input passes straight to the output with no delay buffer and
+        Whisper is idle. When turned back on, output is silent for
+        initialDelaySeconds while the delay buffer refills.
+    */
+    void setFilterEnabled(bool enabled);
+    bool isFilterEnabled() const { return filterEnabled.load(); }
     
+    /** Pass audio straight through (no delay, no muting) for the next few
+        seconds. The browser extension renews this while it mutes a YouTube
+        video itself from the video's captions, so that audio isn't delayed. */
+    void setBypassLease(double seconds)
+    {
+        bypassUntilMs.store(juce::Time::getMillisecondCounterHiRes() + seconds * 1000.0);
+    }
+    bool isBypassed() const { return juce::Time::getMillisecondCounterHiRes() < bypassUntilMs.load(); }
+    
+    const ProfanityFilter& getProfanityFilter() const { return profanityFilter; }
+
+    struct FilterStatus
+    {
+        bool running = false;
+        bool enabled = false;
+        bool buffering = false;      // Filter on but output silent while the delay refills
+        bool bypassed = false;       // Filter on, but passed through for caption muting
+        double delaySeconds = 0.0;   // Delay between input and output (0 when filter is off)
+    };
+
+    /**
+        Snapshot of the toggle and current delay, used by the UI and the
+        local status server that keeps browser video in sync.
+    */
+    FilterStatus getFilterStatus() const;
+    
+    /** Lyrics guide state for the UI (song, where lyrics came from, following). */
+    /** Save the user's Genius API key for lyrics lookups. */
+    void setGeniusToken(const std::string& token)
+    {
+        if (lyricsGuide != nullptr)
+            lyricsGuide->setGeniusToken(token);
+    }
+
+    /** Use pasted lyrics for the song playing now (saved as its local copy). */
+    void setManualLyricsForCurrentSong(const std::string& text)
+    {
+        if (lyricsGuide != nullptr)
+            lyricsGuide->setManualLyrics(text);
+    }
+
+    std::string getFullLyrics() const
+    {
+        return lyricsGuide != nullptr ? lyricsGuide->getFullLyrics() : std::string();
+    }
+
+    LyricsGuide::Status getLyricsStatus() const
+    {
+        return lyricsGuide != nullptr ? lyricsGuide->getStatus() : LyricsGuide::Status();
+    }
+
     /**
         Enable/disable testing mode.
         
@@ -196,8 +269,11 @@ private:
     
     // Configuration variables (easy tuning)
     double chunkSeconds = 2.0;           // Audio chunk size to process (larger chunks = more context)
-    double overlapSeconds = 0.5;         // Overlap between chunks to catch boundary words
-    double initialDelaySeconds = 3.0;   // Initial buffering before playback starts
+    double overlapSeconds = 1.0;         // Audio before each chunk also transcribed, to catch boundary words
+    double initialDelaySeconds = 3.5;   // Delay while filtering: gives late catches (words found at the start of the next slice) time to land
+    int whisperThreads = 8;              // CPU threads for Whisper (set in constructor)
+    std::string whisperModelName = "medium.en";
+    bool loadWhisperModel();
     
     // Simple level tracking for Phase 1-2
     std::atomic<float> currentInputLevel {0.0f};
@@ -213,6 +289,16 @@ private:
     VocalFilter vocalFilter;
     TimestampRefiner timestampRefiner;  // Phase 6: Accurate timestamp refinement
     LyricsAlignment lyricsAlignment;     // Phase 7: Lyrics alignment
+    std::unique_ptr<LyricsGuide> lyricsGuide;  // Checks Whisper against the song's lyrics
+    struct CensorRecord { int pos; int length; std::chrono::steady_clock::time_point when; };
+    std::vector<CensorRecord> recentCensors;   // Stretches censored recently (windows overlap)
+    int lastCuedLine = -1;          // Karaoke: last lyric line scheduled for display
+    double lastCueTime = -1.0;      // ...and when in the stream it starts (seconds)
+    int lastCueGeneration = -1;
+    std::atomic<long long> samplesCaptured{0};   // Input samples since start (stream clock)
+    long long bufferCaptureSamples = 0;          // samplesCaptured when the chunk was sent
+    std::shared_ptr<bool> uiAlive = std::make_shared<bool>(true);  // Guards delayed UI updates
+    double lastMediaPollTime = 0.0;
     
     // Phase 7 (Idea 2): Song Recognition & Lyrics Alignment
     WindowsMediaInfo windowsMediaInfo;
@@ -254,9 +340,23 @@ private:
     // Playback timing
     double streamTime = 0.0;
     std::atomic<bool> playbackStarted{false};
+    std::atomic<bool> outputPaused{false};    // Output silenced while the delay buffer rebuilds
+    std::atomic<bool> filterEnabled{true};    // Filter Explicit Speech toggle
+    std::atomic<double> bypassUntilMs{0.0};   // See setBypassLease
+    bool filterActive() const { return filterEnabled.load() && !isBypassed(); }
+    
+    // Debug: EXPLICITLY_DEBUG_RECORD=<folder> records the first 60s of input
+    // and output (mono) to WAVs, for measuring censor timing
+    std::string debugRecordDir;
+    std::vector<float> debugInput, debugOutput;
+    size_t debugRecordPos = 0;
+    std::atomic<bool> debugRecordFull{false};
+    bool debugRecordWritten = false;
+    bool debugRolling = false;
     std::atomic<bool> wasWaiting{false};
     int debugCounter = 0;
     double bufferCaptureTime = 0.0;
+    double captureStreamSeconds = 0.0;   // Stream time at the end of the chunk being transcribed
     
     // Buffer underrun handling
     std::atomic<bool> bufferUnderrun{false};

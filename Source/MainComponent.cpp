@@ -1,4 +1,4 @@
-/*
+﻿/*
   ==============================================================================
 
     MainComponent.cpp
@@ -21,7 +21,7 @@
 
 MainComponent::MainComponent()
 {
-    setSize (900, 700);
+    setSize (900, 920);
     
     // Title
     titleLabel.setText ("Explicitly Desktop - Real-Time Filter", juce::dontSendNotification);
@@ -51,9 +51,20 @@ MainComponent::MainComponent()
     
     censorModeCombo.addItem ("Reverse", 1);
     censorModeCombo.addItem ("Mute", 2);
-    censorModeCombo.setSelectedId (1);  // Default: Reverse
+    censorModeCombo.setSelectedId (2);  // Default: Mute
     addAndMakeVisible (censorModeCombo);
     
+    // Whisper model picker (lightest to heaviest)
+    modelLabel.setText ("Whisper Model:", juce::dontSendNotification);
+    addAndMakeVisible (modelLabel);
+    {
+        int id = 1;
+        for (auto& m : AudioEngine::availableModels())
+            modelCombo.addItem (m.label, id++);
+    }
+    modelCombo.onChange = [this] { applyModelChoice(); };
+    addAndMakeVisible (modelCombo);
+
     // Start/Stop Button
     startStopButton.setButtonText ("Start Processing");
     startStopButton.onClick = [this] 
@@ -64,6 +75,16 @@ MainComponent::MainComponent()
             stopProcessing();
     };
     addAndMakeVisible (startStopButton);
+    
+    // Filter Explicit Speech toggle (off = no delay, audio passes straight through)
+    filterToggleButton.setClickingTogglesState (false);
+    filterToggleButton.onClick = [this]
+    {
+        audioEngine->setFilterEnabled (! audioEngine->isFilterEnabled());
+        updateFilterButton();
+        saveSettings();
+    };
+    addAndMakeVisible (filterToggleButton);
     
     // Status
     statusLabel.setText ("Status:", juce::dontSendNotification);
@@ -117,7 +138,7 @@ MainComponent::MainComponent()
     addAndMakeVisible (liveLyricsLabel);
     
     liveLyricsDisplay.setText ("", juce::dontSendNotification);
-    liveLyricsDisplay.setFont (juce::Font (28.0f, juce::Font::bold));
+    liveLyricsDisplay.setFont (juce::Font (20.0f, juce::Font::bold));
     liveLyricsDisplay.setJustificationType (juce::Justification::centred);
     liveLyricsDisplay.setColour (juce::Label::backgroundColourId, juce::Colours::darkgrey);
     liveLyricsDisplay.setColour (juce::Label::textColourId, juce::Colours::lightblue);
@@ -129,7 +150,8 @@ MainComponent::MainComponent()
     addAndMakeVisible (actualLyricsLabel);
     
     actualLyricsDisplay.setText ("", juce::dontSendNotification);
-    actualLyricsDisplay.setFont (juce::Font (32.0f, juce::Font::bold));
+    actualLyricsDisplay.setFont (juce::Font (24.0f, juce::Font::bold));
+    actualLyricsDisplay.setMinimumHorizontalScale (0.5f);
     actualLyricsDisplay.setJustificationType (juce::Justification::centred);
     actualLyricsDisplay.setColour (juce::Label::backgroundColourId, juce::Colours::black);
     actualLyricsDisplay.setColour (juce::Label::textColourId, juce::Colours::white);
@@ -147,6 +169,19 @@ MainComponent::MainComponent()
     songInfoDisplay.setColour (juce::Label::textColourId, juce::Colours::yellow);
     addAndMakeVisible (songInfoDisplay);
     
+    // Paste lyrics (from any site) for the song playing now
+    pasteLyricsButton.setButtonText ("Paste lyrics");
+    pasteLyricsButton.onClick = [this] { showPasteLyrics(); };
+    addAndMakeVisible (pasteLyricsButton);
+
+    geniusKeyButton.setButtonText (LyricsGuide::hasGeniusToken() ? "Genius key: set" : "Genius key");
+    geniusKeyButton.onClick = [this] { showGeniusKey(); };
+    addAndMakeVisible (geniusKeyButton);
+
+    previewLyricsButton.setButtonText ("Preview Full Lyrics");
+    previewLyricsButton.onClick = [this] { showFullLyrics(); };
+    addChildComponent (previewLyricsButton);   // Visible once lyrics are found
+
     // Debug Controls
     showRawJsonToggle.setButtonText ("Show Raw JSON");
     addAndMakeVisible (showRawJsonToggle);
@@ -211,7 +246,7 @@ MainComponent::MainComponent()
                 
                 // Clear actual lyrics display to show "Loading new lyrics..."
                 recentActualLyrics.clear();
-                actualLyricsDisplay.setText("🔄 Loading lyrics...", juce::dontSendNotification);
+                actualLyricsDisplay.setText("Loading lyrics...", juce::dontSendNotification);
                 actualLyricsDisplay.setColour(juce::Label::textColourId, juce::Colours::cyan);
                 
                 // Also flash the background to indicate song change
@@ -220,8 +255,15 @@ MainComponent::MainComponent()
         });
     });
     
-    // Populate device lists
+    // Local control port for the browser extension (YouTube video delay sync)
+    controlServer = std::make_unique<ControlServer> (*audioEngine);
+    controlServer->onFilterChanged = [this] { updateFilterButton(); saveSettings(); };
+    controlServer->start();
+    updateFilterButton();
+    
+    // Populate device lists, then restore last session (and auto-start if configured)
     updateDeviceList();
+    restoreSettings();
     
     // Start timer for status updates (every 100ms)
     startTimer (100);
@@ -230,6 +272,7 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 {
     stopTimer();
+    controlServer.reset();
     if (isProcessing)
         stopProcessing();
 }
@@ -262,11 +305,17 @@ void MainComponent::resized()
     // Censor Mode
     auto censorRow = area.removeFromTop (30);
     censorModeLabel.setBounds (censorRow.removeFromLeft (120));
-    censorModeCombo.setBounds (censorRow.removeFromLeft (200));
+    censorModeCombo.setBounds (censorRow.removeFromLeft (120));
+    censorRow.removeFromLeft (20);
+    modelLabel.setBounds (censorRow.removeFromLeft (110));
+    modelCombo.setBounds (censorRow);
     area.removeFromTop (20);
     
     // Start/Stop Button
-    startStopButton.setBounds (area.removeFromTop (50).reduced (150, 0));
+    auto buttonRow = area.removeFromTop (50).reduced (60, 0);
+    startStopButton.setBounds (buttonRow.removeFromLeft (buttonRow.getWidth() / 2 - 10));
+    buttonRow.removeFromLeft (20);
+    filterToggleButton.setBounds (buttonRow);
     area.removeFromTop (30);
     
     // Status
@@ -289,17 +338,24 @@ void MainComponent::resized()
     
     // Actual lyrics display (large, prominent - shows correct lyrics)
     actualLyricsLabel.setBounds (area.removeFromTop (25));
-    actualLyricsDisplay.setBounds (area.removeFromTop (70));
+    actualLyricsDisplay.setBounds (area.removeFromTop (140));  // Previous, current and next two lines
     area.removeFromTop (5);
     
     // Live lyrics display (shows what Whisper heard)
     liveLyricsLabel.setBounds (area.removeFromTop (25));
-    liveLyricsDisplay.setBounds (area.removeFromTop (60));
+    liveLyricsDisplay.setBounds (area.removeFromTop (40));
     area.removeFromTop (10);
     
     // Song recognition display
     songInfoLabel.setBounds (area.removeFromTop (25));
-    songInfoDisplay.setBounds (area.removeFromTop (50));
+    auto songRow = area.removeFromTop (50);
+    geniusKeyButton.setBounds (songRow.removeFromRight (120).reduced (0, 8));
+    songRow.removeFromRight (6);
+    previewLyricsButton.setBounds (songRow.removeFromRight (150).reduced (0, 8));
+    songRow.removeFromRight (6);
+    pasteLyricsButton.setBounds (songRow.removeFromRight (110).reduced (0, 8));
+    songRow.removeFromRight (10);
+    songInfoDisplay.setBounds (songRow);
     area.removeFromTop (10);
     
     // Debug displays - split remaining area
@@ -327,9 +383,35 @@ void MainComponent::resized()
 
 void MainComponent::timerCallback()
 {
+    // Every few seconds, route any newly started app the same way: through the
+    // filter while processing, otherwise to the normal output
+    if (++routerTicks >= 30)
+    {
+        routerTicks = 0;
+        appRouter.update (isProcessing);
+    }
+    
+    // EXPLICITLY_SNAPSHOT=<file.png>: save a picture of the window once karaoke
+    // lyrics are showing (for documentation)
+    if (auto* snapshotPath = std::getenv ("EXPLICITLY_SNAPSHOT"))
+    {
+        if (! snapshotTaken && actualLyricsDisplay.getText().containsChar ((juce::juce_wchar) 10)
+            && liveLyricsDisplay.getText().isNotEmpty() && ++snapshotCountdown > 120)
+        {
+            snapshotTaken = true;
+            juce::File file (snapshotPath);
+            file.deleteFile();
+            juce::FileOutputStream stream (file);
+            juce::PNGImageFormat().writeImageToStream (createComponentSnapshot (getLocalBounds(), true, 1.0f), stream);
+            std::cout << "[Snapshot] Saved " << file.getFullPathName() << std::endl;
+        }
+    }
+    
     if (isProcessing)
     {
         updateLatencyDisplay();
+        updateFilterButton();
+        updateLyricsStatus();
         
         // Phase 1: Update level meter
         float level = audioEngine->getCurrentInputLevel();
@@ -395,9 +477,12 @@ void MainComponent::startProcessing()
         startStopButton.setButtonText ("Stop Processing");
         logFile.appendText("Updated button text\n");
         statusValueLabel.setText ("Processing", juce::dontSendNotification);
+        appRouter.update (true);   // Send the apps through the filter
         logFile.appendText("Updated status text\n");
         statusValueLabel.setColour (juce::Label::textColourId, juce::Colours::green);
         logFile.appendText("Updated status color\n");
+        
+        saveSettings();
         
         // Disable device selection during processing
         inputDeviceCombo.setEnabled (false);
@@ -422,6 +507,9 @@ void MainComponent::stopProcessing()
 {
     audioEngine->stop();
     
+    // Give the apps their normal output back, so they play without the filter
+    appRouter.restoreAll();
+    
     isProcessing = false;
     startStopButton.setButtonText ("Start Processing");
     statusValueLabel.setText ("Idle", juce::dontSendNotification);
@@ -445,6 +533,246 @@ void MainComponent::stopProcessing()
     censorModeCombo.setEnabled (true);
 }
 
+void MainComponent::restoreSettings()
+{
+    juce::PropertiesFile::Options options;
+    options.applicationName = "ExplicitlyDesktop";
+    options.filenameSuffix = ".settings";
+    options.folderName = "ExplicitlyDesktop";
+    options.osxLibrarySubFolder = "Application Support";
+    appProperties.setStorageParameters (options);
+    
+    auto* settings = appProperties.getUserSettings();
+    
+    auto selectByText = [] (juce::ComboBox& combo, const juce::String& text)
+    {
+        for (int i = 0; i < combo.getNumItems(); ++i)
+        {
+            if (combo.getItemText (i) == text)
+            {
+                combo.setSelectedItemIndex (i, juce::dontSendNotification);
+                return true;
+            }
+        }
+        return false;
+    };
+    
+    bool haveInput = selectByText (inputDeviceCombo, settings->getValue ("inputDevice"));
+    bool haveOutput = selectByText (outputDeviceCombo, settings->getValue ("outputDevice"));
+    
+    // Testing: EXPLICITLY_OUTPUT_DEVICE plays to another device without saving it
+    if (auto* testOutput = std::getenv ("EXPLICITLY_OUTPUT_DEVICE"))
+    {
+        haveOutput = selectByText (outputDeviceCombo, testOutput);
+        outputOverridden = haveOutput;
+    }
+    censorModeCombo.setSelectedId (settings->getIntValue ("censorMode", 2), juce::dontSendNotification);
+    audioEngine->setFilterEnabled (settings->getBoolValue ("filterEnabled", true));
+    
+    // Apps sent through the filter (exe names)
+    appRouter.setApps (juce::StringArray::fromTokens (
+        settings->getValue ("routedApps", "Spotify.exe,firefox.exe,chrome.exe,brave.exe"), ",", ""));
+
+    // Whisper model (EXPLICITLY_WHISPER_MODEL, if set, wins for testing)
+    if (std::getenv ("EXPLICITLY_WHISPER_MODEL") == nullptr)
+        audioEngine->setWhisperModel (settings->getValue ("whisperModel", "medium.en").toStdString());
+    {
+        int id = 1;
+        for (auto& m : AudioEngine::availableModels())
+        {
+            if (m.name == audioEngine->getWhisperModel())
+                modelCombo.setSelectedId (id, juce::dontSendNotification);
+            ++id;
+        }
+    }
+    updateFilterButton();
+    
+    // Apps routed to VB-CABLE are silent unless we're processing, so start
+    // automatically once devices have been chosen and started successfully before
+    if (haveInput && haveOutput && settings->getBoolValue ("autoStart", false))
+        juce::MessageManager::callAsync ([this] { if (! isProcessing) startProcessing(); });
+}
+
+void MainComponent::saveSettings()
+{
+    auto* settings = appProperties.getUserSettings();
+    if (settings == nullptr)
+        return;
+    
+    settings->setValue ("inputDevice", inputDeviceCombo.getText());
+    if (! outputOverridden)
+        settings->setValue ("outputDevice", outputDeviceCombo.getText());
+    settings->setValue ("censorMode", censorModeCombo.getSelectedId());
+    settings->setValue ("filterEnabled", audioEngine->isFilterEnabled());
+    settings->setValue ("routedApps", appRouter.getApps().joinIntoString (","));
+    settings->setValue ("whisperModel", juce::String (audioEngine->getWhisperModel()));
+    if (isProcessing)
+        settings->setValue ("autoStart", true);
+    settings->saveIfNeeded();
+}
+
+void MainComponent::showGeniusKey()
+{
+    geniusKeyWindow = std::make_unique<juce::AlertWindow> ("Genius key",
+        "Paste your Genius API client access token. It is saved on this PC only "
+        "(%APPDATA%\\ExplicitlyDesktop\\genius_token.txt) and used to look up lyrics.",
+        juce::AlertWindow::NoIcon);
+    geniusKeyWindow->addTextEditor ("token", {}, "Access token", true);   // Shown as dots
+    geniusKeyWindow->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey));
+    geniusKeyWindow->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    geniusKeyWindow->enterModalState (true, juce::ModalCallbackFunction::create ([this] (int result)
+    {
+        if (result == 1 && geniusKeyWindow != nullptr)
+        {
+            auto token = geniusKeyWindow->getTextEditorContents ("token").trim();
+            if (token.isNotEmpty())
+            {
+                audioEngine->setGeniusToken (token.toStdString());
+                geniusKeyButton.setButtonText ("Genius key: set");
+            }
+        }
+        juce::MessageManager::callAsync ([this] { geniusKeyWindow.reset(); });
+    }), false);
+}
+
+void MainComponent::showPasteLyrics()
+{
+    auto status = audioEngine->getLyricsStatus();
+    if (status.song.empty())
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::AlertWindow::InfoIcon, "Paste lyrics",
+                                                "Play the song first, so the lyrics can be saved for it.");
+        return;
+    }
+
+    pasteLyricsEditor = std::make_unique<juce::TextEditor>();
+    pasteLyricsEditor->setMultiLine (true, true);
+    pasteLyricsEditor->setReturnKeyStartsNewLine (true);
+    pasteLyricsEditor->setScrollbarsShown (true);
+    pasteLyricsEditor->setSize (520, 320);
+
+    pasteLyricsWindow = std::make_unique<juce::AlertWindow> ("Paste lyrics",
+        "Lyrics for " + juce::String (status.song) + ". They are kept for this song "
+        "and replace any lyrics found online.", juce::AlertWindow::NoIcon);
+    pasteLyricsWindow->addCustomComponent (pasteLyricsEditor.get());
+    pasteLyricsWindow->addButton ("Save", 1, juce::KeyPress (juce::KeyPress::returnKey, juce::ModifierKeys::ctrlModifier, 0));
+    pasteLyricsWindow->addButton ("Cancel", 0, juce::KeyPress (juce::KeyPress::escapeKey));
+    pasteLyricsWindow->enterModalState (true, juce::ModalCallbackFunction::create ([this] (int result)
+    {
+        if (result == 1 && pasteLyricsEditor != nullptr)
+            audioEngine->setManualLyricsForCurrentSong (pasteLyricsEditor->getText().toStdString());
+        if (pasteLyricsWindow != nullptr)
+            pasteLyricsWindow->removeCustomComponent (0);
+        juce::MessageManager::callAsync ([this] { pasteLyricsWindow.reset(); pasteLyricsEditor.reset(); });
+    }), false);
+}
+
+void MainComponent::showFullLyrics()
+{
+    auto text = audioEngine->getFullLyrics();
+    if (text.empty())
+        return;
+
+    auto status = audioEngine->getLyricsStatus();
+    juce::String title = "Lyrics - " + juce::String (status.song);
+
+    // Reuse the window if it's open, so it follows song changes
+    if (lyricsPreviewWindow != nullptr)
+    {
+        if (auto* editor = dynamic_cast<juce::TextEditor*> (lyricsPreviewWindow->getContentComponent()))
+            editor->setText (text, false);
+        lyricsPreviewWindow->setName (title);
+        lyricsPreviewWindow->toFront (true);
+        return;
+    }
+
+    auto* editor = new juce::TextEditor();
+    editor->setMultiLine (true, true);
+    editor->setReadOnly (true);
+    editor->setScrollbarsShown (true);
+    editor->setCaretVisible (false);
+    editor->setFont (juce::FontOptions (17.0f));
+    editor->setText (text, false);
+    editor->setSize (520, 640);
+
+    juce::DialogWindow::LaunchOptions options;
+    options.content.setOwned (editor);
+    options.dialogTitle = title;
+    options.dialogBackgroundColour = getLookAndFeel().findColour (juce::ResizableWindow::backgroundColourId);
+    options.escapeKeyTriggersCloseButton = true;
+    options.useNativeTitleBar = true;
+    options.resizable = true;
+    lyricsPreviewWindow = options.launchAsync();
+}
+
+void MainComponent::updateLyricsStatus()
+{
+    auto status = audioEngine->getLyricsStatus();
+    previewLyricsButton.setVisible (status.hasLyrics);
+    if (status.song.empty())
+        return;
+    
+    juce::String text = juce::String (status.song) + "   |   Lyrics: ";
+    juce::Colour colour = juce::Colours::yellow;
+    
+    if (status.searching)
+        text << "looking up...";
+    else if (! status.hasLyrics)
+        text << "none found (Whisper only)" << (status.geniusKeyRejected ? "  -  Genius rejected the key" : "");
+    else if (status.following)
+    {
+        text << "following (" << juce::String (status.source) << ")";
+        colour = juce::Colours::lightgreen;
+    }
+    else
+        text << "loaded, listening for a match (" << juce::String (status.source) << ")";
+    
+    if (songInfoDisplay.getText() != text)
+    {
+        songInfoDisplay.setText (text, juce::dontSendNotification);
+        songInfoDisplay.setColour (juce::Label::textColourId, colour);
+    }
+}
+
+void MainComponent::applyModelChoice()
+{
+    int index = modelCombo.getSelectedId() - 1;
+    const auto& models = AudioEngine::availableModels();
+    if (index < 0 || index >= (int) models.size() || models[(size_t) index].name == audioEngine->getWhisperModel())
+        return;
+
+    // Switching models needs a restart of processing (the new model loads on start)
+    bool wasProcessing = isProcessing;
+    if (wasProcessing)
+        stopProcessing();
+    audioEngine->setWhisperModel (models[(size_t) index].name);
+    saveSettings();
+    if (wasProcessing)
+    {
+        statusValueLabel.setText ("Loading " + juce::String (models[(size_t) index].name) + "...", juce::dontSendNotification);
+        juce::MessageManager::callAsync ([this] { startProcessing(); });
+    }
+}
+
+void MainComponent::updateFilterButton()
+{
+    auto status = audioEngine->getFilterStatus();
+    
+    juce::String text = "Filter Explicit Speech: ";
+    if (! status.enabled)
+        text << "OFF (no delay)";
+    else if (status.bypassed)
+        text << "ON (video captions, no delay)";
+    else if (status.running && status.buffering)
+        text << "ON (buffering...)";
+    else
+        text << "ON";
+    
+    filterToggleButton.setButtonText (text);
+    filterToggleButton.setColour (juce::TextButton::buttonColourId,
+                                  status.enabled ? juce::Colours::darkgreen : juce::Colours::darkred);
+}
+
 void MainComponent::updateLatencyDisplay()
 {
     // Display buffer size (grows over time as processing accumulates)
@@ -464,7 +792,7 @@ void MainComponent::updateLatencyDisplay()
         // Show warning if buffer is critically low
         if (isUnderrun)
         {
-            latencyValueLabel.setText ("⚠ UNDERRUN - UNCENSORED", juce::dontSendNotification);
+            latencyValueLabel.setText ("UNDERRUN - UNCENSORED", juce::dontSendNotification);
             latencyValueLabel.setColour (juce::Label::textColourId, juce::Colours::red);
         }
         else
@@ -473,9 +801,12 @@ void MainComponent::updateLatencyDisplay()
             latencyValueLabel.setText (juce::String (bufferSize, 2) + " s buffer", juce::dontSendNotification);
             
             // Color code: green 14-17s (healthy), yellow 12-14s or 17-19s (borderline), red <12s or >19s (critical)
-            if (bufferSize >= 14.0 && bufferSize <= 17.0)
+            // Green at the normal delay; yellow when getting close to the point
+            // where words can't be muted in time (the old 14-17 s range was
+            // from an earlier design and always showed red)
+            if (bufferSize >= 3.0)
                 latencyValueLabel.setColour (juce::Label::textColourId, juce::Colours::green);
-            else if (bufferSize >= 12.0 && bufferSize < 19.0)
+            else if (bufferSize >= 2.5)
                 latencyValueLabel.setColour (juce::Label::textColourId, juce::Colours::yellow);
             else
                 latencyValueLabel.setColour (juce::Label::textColourId, juce::Colours::red);
@@ -640,27 +971,9 @@ void MainComponent::updateLiveLyrics(const juce::String& words)
 
 void MainComponent::updateActualLyrics(const juce::String& words)
 {
-    // Keep last ~10 words visible (actual aligned lyrics)
-    recentActualLyrics += " " + words;
-    
-    // Trim to last 10 words
-    juce::StringArray wordArray;
-    wordArray.addTokens(recentActualLyrics, " ", "");
-    
-    if (wordArray.size() > 10)
-    {
-        int startIndex = wordArray.size() - 10;
-        juce::String trimmed;
-        for (int i = startIndex; i < wordArray.size(); ++i)
-        {
-            if (i > startIndex)
-                trimmed += " ";
-            trimmed += wordArray[i];
-        }
-        recentActualLyrics = trimmed;
-    }
-    
-    // Update display and restore normal colors (in case showing "Loading...")
+    // The engine sends the lyrics line(s) being sung right now (or Whisper's
+    // words when the song has no lyrics), so replace rather than append
+    recentActualLyrics = words;
     actualLyricsDisplay.setText(recentActualLyrics, juce::dontSendNotification);
     actualLyricsDisplay.setColour(juce::Label::textColourId, juce::Colours::white);
     actualLyricsDisplay.setColour(juce::Label::backgroundColourId, juce::Colours::black);
